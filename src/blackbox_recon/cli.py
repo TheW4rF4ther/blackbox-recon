@@ -25,15 +25,11 @@ console = Console()
 def print_banner():
     """Print the Blackbox Recon banner."""
     console.print()
-    # ADD YOUR ASCII ART HERE - Each line should start with: console.print(r"[bold #CC5500] ... [/bold #CC5500]")
-    # Example format:
-    # console.print(r"[bold #CC5500]  _   _   _   _   _   _   _   _   _   _   _   _   _   _   _   _   _   _   _ [/bold #CC5500]")
-    # console.print(r"[bold #CC5500] / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \[/bold #CC5500]")
-    # console.print(r"[bold #CC5500]( R | E | C | O | N )[/bold #CC5500]")
-    # console.print(r"[bold #CC5500] \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/ \_/[/bold #CC5500]")
-    #
-    # Or use bright_red instead of #CC5500 for bright red color
-    # Or use #FF6B35 for orange-red
+    console.print(r"[bold red]  ____   _____   ____   ____   _   _ [/bold red]")
+    console.print(r"[bold red] |  _ \ / ___| / ___||  _ \ | \ | |[/bold red]")
+    console.print(r"[bold red] | |_) | |    | |    | | | ||  \| |[/bold red]")
+    console.print(r"[bold red] |  _ <| |___ | |___ | |_| || |\  |[/bold red]")
+    console.print(r"[bold red] |_| \_\\____| \____||____/ |_| \_|[/bold red]")
     console.print()
     console.print("[bold yellow]  AI-Augmented Reconnaissance for Pentesters[/bold yellow]")
     console.print("[dim]         by Blackbox Intelligence Group LLC[/dim]")

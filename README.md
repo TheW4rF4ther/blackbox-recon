@@ -1,6 +1,8 @@
 <div align="center">
   <img src="assets/logo.png" alt="Blackbox Recon Logo" width="600">
   
+  # 🔍 Blackbox Recon
+  
   **AI-Augmented Reconnaissance for Penetration Testers**
   
   [![Version](https://img.shields.io/badge/version-1.0.0-red.svg)](https://github.com/TheW4rF4ther/blackbox-recon/releases)
