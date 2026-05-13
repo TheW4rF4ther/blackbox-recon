@@ -1,0 +1,22 @@
+# Blackbox Recon Configuration - LM Studio / Local LLM Example
+
+ai:
+  provider: local
+  url: http://localhost:1234/v1
+  model: qwen2.5-9b-instruct
+  temperature: 0.3
+  max_tokens: 4000
+
+recon:
+  threads: 50
+  timeout: 30
+  ports: top1000
+  rate_limit: 0
+
+modules:
+  - subdomain
+  - portscan
+  - technology
+
+output_format: markdown
+verbose: true
