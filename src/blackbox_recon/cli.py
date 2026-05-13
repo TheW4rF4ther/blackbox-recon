@@ -9,7 +9,6 @@ from pathlib import Path
 
 import click
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 from rich.panel import Panel
 from rich import box
@@ -19,17 +18,22 @@ from .recon import ReconEngine
 from .ai_analyzer import AIAnalyzer, AnalysisResult
 
 
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+
 console = Console()
 
 
 def print_banner():
     """Print the Blackbox Recon banner."""
+    o = "[bold #d94a34]"
+    c = "[/bold #d94a34]"
     console.print()
-    console.print(r"[bold red]  ____   _____   ____   ____   _   _ [/bold red]")
-    console.print(r"[bold red] |  _ \ / ___| / ___||  _ \ | \ | |[/bold red]")
-    console.print(r"[bold red] | |_) | |    | |    | | | ||  \| |[/bold red]")
-    console.print(r"[bold red] |  _ <| |___ | |___ | |_| || |\  |[/bold red]")
-    console.print(r"[bold red] |_| \_\\____| \____||____/ |_| \_|[/bold red]")
+    console.print(rf"{o} ___  ___  ___  ___  _  _ {c}")
+    console.print(rf"{o}| _ \| __|/ __|/ _ \| \| |{c}")
+    console.print(rf"{o}|   /| _|| (__| (_) | .` |{c}")
+    console.print(rf"{o}|_|_\|___|\___|\___/|_|\_|{c}")
     console.print()
     console.print("[bold yellow]  AI-Augmented Reconnaissance for Pentesters[/bold yellow]")
     console.print("[dim]         by Blackbox Intelligence Group LLC[/dim]")
