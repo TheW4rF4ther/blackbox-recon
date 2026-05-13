@@ -5,7 +5,7 @@ __author__ = "Blackbox Intelligence Group LLC"
 __email__ = "info@blackboxintelgroup.com"
 __license__ = "MIT"
 
-from .core import ReconEngine
+from .recon import ReconEngine
 from .ai_analyzer import AIAnalyzer
 from .config import Config
 

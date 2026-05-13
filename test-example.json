@@ -1,0 +1,85 @@
+{
+  "target": "example.com",
+  "timestamp": "2026-05-13T17:40:55.484495",
+  "subdomains": [
+    {
+      "subdomain": "www.example.com",
+      "ip_addresses": [
+        "172.66.147.243",
+        "104.20.23.154"
+      ],
+      "status_code": 200,
+      "server": "cloudflare",
+      "technologies": []
+    }
+  ],
+  "ports": [],
+  "technologies": [
+    {
+      "url": "http://example.com",
+      "technologies": [],
+      "headers": {
+        "Date": "Wed, 13 May 2026 21:40:55 GMT",
+        "Content-Type": "text/html",
+        "Transfer-Encoding": "chunked",
+        "Connection": "keep-alive",
+        "Server": "cloudflare",
+        "Last-Modified": "Sat, 09 May 2026 09:00:11 GMT",
+        "Allow": "GET, HEAD",
+        "cf-cache-status": "HIT",
+        "Age": "416",
+        "Content-Encoding": "gzip",
+        "CF-RAY": "9fb4d3051bd1458a-ATL"
+      },
+      "interesting_headers": [
+        "Server: cloudflare"
+      ]
+    },
+    {
+      "url": "https://example.com",
+      "technologies": [],
+      "headers": {
+        "Date": "Wed, 13 May 2026 21:40:55 GMT",
+        "Content-Type": "text/html",
+        "Transfer-Encoding": "chunked",
+        "Connection": "keep-alive",
+        "Server": "cloudflare",
+        "last-modified": "Mon, 11 May 2026 20:01:07 GMT",
+        "allow": "GET, HEAD",
+        "Age": "412",
+        "cf-cache-status": "HIT",
+        "Content-Encoding": "gzip",
+        "CF-RAY": "9fb4d3060bfe570d-ATL"
+      },
+      "interesting_headers": [
+        "Server: cloudflare"
+      ]
+    },
+    {
+      "url": "http://www.example.com",
+      "technologies": [],
+      "headers": {
+        "Date": "Wed, 13 May 2026 21:40:55 GMT",
+        "Content-Type": "text/html",
+        "Transfer-Encoding": "chunked",
+        "Connection": "keep-alive",
+        "Server": "cloudflare",
+        "Last-Modified": "Sat, 09 May 2026 09:00:11 GMT",
+        "Allow": "GET, HEAD",
+        "cf-cache-status": "HIT",
+        "Age": "2843",
+        "Content-Encoding": "gzip",
+        "CF-RAY": "9fb4d306795fc024-ATL"
+      },
+      "interesting_headers": [
+        "Server: cloudflare"
+      ]
+    }
+  ],
+  "summary": {
+    "total_subdomains": 1,
+    "total_open_ports": 0,
+    "total_tech_detected": 3,
+    "web_services": 1
+  }
+}

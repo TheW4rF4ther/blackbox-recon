@@ -24,23 +24,22 @@ console = Console()
 
 def print_banner():
     """Print the Blackbox Recon banner."""
-    banner = """
+    banner = r"""
 [bold red]
-██████╗ ██╗      █████╗  ██████╗██╗  ██╗██████╗  ██████╗ ██╗  ██╗
-██╔══██╗██║     ██╔══██╗██╔════╝██║ ██╔╝██╔══██╗██╔═══██╗╚██╗██╔╝
-██████╔╝██║     ███████║██║     █████╔╝ ██████╔╝██║   ██║ ╚███╔╝ 
-██╔══██╗██║     ██╔══██║██║     ██╔═██╗ ██╔══██╗██║   ██║ ██╔██╗ 
-██████╔╝███████╗██║  ██║╚██████╗██║  ██╗██║  ██║╚██████╔╝██╔╝ ██╗
-╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝
+  ____  _            _    _     ____                       
+ | __ )| | __ _  ___| | _| |_/ ___|  ___  ___ __ _ _ __  
+ |  _ \| |/ _` |/ __| |/ / __\___ \ / _ \/ __/ _` | '__| 
+ | |_) | | (_| | (__|   <| |_ ___) |  __/ (_| (_| | |    
+ |____/|_|\__,_|\___|_|\_\\__|____/ \___|\___\__,_|_|    
 [/bold red]
-[bold yellow]     AI-Augmented Reconnaissance for Penetration Testers[/bold yellow]
-[dim]                    by Blackbox Intelligence Group LLC[/dim]
+[bold yellow]       AI-Augmented Reconnaissance for Penetration Testers[/bold yellow]
+[dim]                      by Blackbox Intelligence Group LLC[/dim]
 """
     console.print(banner)
 
 
 @click.command()
-@click.option('--target', '-t', required=True, help='Target domain to reconnaissance')
+@click.option('--target', '-t', required=False, help='Target domain to reconnaissance')
 @click.option('--config', '-c', type=click.Path(), help='Path to config file')
 @click.option('--output', '-o', type=click.Path(), help='Output file path')
 @click.option('--format', '-f', 'output_format', default='json', 
@@ -94,7 +93,12 @@ def main(target, config, output, output_format, modules, ai_mode, ai_model,
     else:
         modules_list = [m.strip() for m in modules.split(',')]
     
-    # Validate target
+    # Validate target (required unless using --init-config)
+    if not target:
+        console.print("[red][!] Target is required (use -t DOMAIN)[/red]")
+        console.print("[dim]Run with --help for usage information[/dim]")
+        sys.exit(1)
+    
     if not target.replace('.', '').replace('-', '').isalnum():
         console.print("[red][!] Invalid target format[/red]")
         sys.exit(1)
@@ -110,14 +114,8 @@ def main(target, config, output, output_format, modules, ai_mode, ai_model,
         
         engine = ReconEngine(recon_config)
         
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console
-        ) as progress:
-            task = progress.add_task("[cyan]Running reconnaissance...", total=None)
-            results = asyncio.run(engine.run(target, modules_list))
-            progress.update(task, completed=True)
+        console.print("[cyan][*] Running reconnaissance...[/cyan]")
+        results = asyncio.run(engine.run(target, modules_list))
         
         # AI Analysis
         if ai_mode != 'none':
@@ -148,8 +146,8 @@ def main(target, config, output, output_format, modules, ai_mode, ai_model,
                         model=ai_model
                     )
                 
-                with console.status("[bold green]AI analyzing attack surface..."):
-                    analysis = analyzer.analyze_recon_data(results)
+                console.print("[bold green][*] AI analyzing attack surface...[/bold green]")
+                analysis = analyzer.analyze_recon_data(results)
                 
                 # Display AI analysis
                 console.print("\n[bold yellow]AI Analysis Results[/bold yellow]")
@@ -205,7 +203,7 @@ def main(target, config, output, output_format, modules, ai_mode, ai_model,
         if results.get('subdomains'):
             console.print("\n[bold yellow]Top Subdomains:[/bold yellow]")
             for sub in results['subdomains'][:5]:
-                console.print(f"  • {sub['subdomain']} ({', '.join(sub['ip_addresses'][:2])})")
+                console.print(f"  - {sub['subdomain']} ({', '.join(sub['ip_addresses'][:2])})")
         
         if results.get('ports'):
             console.print("\n[bold yellow]Open Ports:[/bold yellow]")
@@ -217,7 +215,7 @@ def main(target, config, output, output_format, modules, ai_mode, ai_model,
                 ports_by_host[host].append(f"{port['port']}/{port['service']}")
             
             for host, ports in list(ports_by_host.items())[:3]:
-                console.print(f"  • {host}: {', '.join(ports[:5])}")
+                console.print(f"  - {host}: {', '.join(ports[:5])}")
         
         console.print("\n[dim]Done. Stay safe, hack ethically.[/dim]")
         

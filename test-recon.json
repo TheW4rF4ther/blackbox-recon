@@ -1,0 +1,13 @@
+{
+  "target": "scanme.nmap.org",
+  "timestamp": "2026-05-13T17:40:48.282794",
+  "subdomains": [],
+  "ports": [],
+  "technologies": [],
+  "summary": {
+    "total_subdomains": 0,
+    "total_open_ports": 0,
+    "total_tech_detected": 0,
+    "web_services": 0
+  }
+}
