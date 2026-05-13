@@ -15,7 +15,12 @@ from rich import box
 
 from .config import Config, create_default_config
 from .recon import ReconEngine
-from .ai_analyzer import AIAnalyzer, AnalysisResult
+from .ai_analyzer import (
+    AIAnalyzer,
+    AnalysisResult,
+    check_local_llm_connection,
+    check_ollama_connection,
+)
 
 
 for stream in (sys.stdout, sys.stderr):
@@ -55,12 +60,17 @@ def print_banner():
 @click.option('--local-url', default='http://localhost:1234/v1', help='URL for local LLM (LM Studio)')
 @click.option('--ollama-url', default='http://localhost:11434', help='URL for Ollama')
 @click.option('--ollama-model', default='llama3.1', help='Ollama model name')
+@click.option(
+    '--skip-ai-precheck',
+    is_flag=True,
+    help='Skip local/Ollama connectivity check before recon (not recommended)',
+)
 @click.option('--full', is_flag=True, help='Enable all modules')
 @click.option('--init-config', is_flag=True, help='Create default configuration file')
 @click.option('--verbose', '-v', is_flag=True, help='Verbose output')
 @click.version_option(version='1.0.0', prog_name='blackbox-recon')
 def main(target, config, output, output_format, modules, ai_mode, ai_model,
-         local_url, ollama_url, ollama_model, full, init_config, verbose):
+         local_url, ollama_url, ollama_model, skip_ai_precheck, full, init_config, verbose):
     """Blackbox Recon - AI-Augmented Reconnaissance for Penetration Testers."""
     
     print_banner()
@@ -104,6 +114,33 @@ def main(target, config, output, output_format, modules, ai_mode, ai_model,
     if not target.replace('.', '').replace('-', '').isalnum():
         console.print("[red][!] Invalid target format[/red]")
         sys.exit(1)
+
+    if ai_mode == 'local' and not skip_ai_precheck:
+        console.print("[cyan][*] Checking local LLM API...[/cyan]")
+        try:
+            status, auto_model_id = check_local_llm_connection(local_url)
+            console.print(f"[green][+][/green] Local LLM OK ({status}) at [cyan]{local_url}[/cyan]")
+            if not ai_model and auto_model_id:
+                ai_model = auto_model_id
+                console.print(f"[dim]No --ai-model provided; using first server model: {auto_model_id}[/dim]")
+        except Exception as exc:
+            console.print(f"[red][!] Local LLM not reachable at {local_url}[/red]")
+            console.print(f"[dim]{exc}[/dim]")
+            console.print(
+                "[dim]Tip: start LM Studio local server, use base URL ending in /v1, "
+                "and try GET /v1/models in a browser. Use --skip-ai-precheck to run recon anyway.[/dim]"
+            )
+            sys.exit(1)
+    elif ai_mode == 'ollama' and not skip_ai_precheck:
+        console.print("[cyan][*] Checking Ollama API...[/cyan]")
+        try:
+            status = check_ollama_connection(ollama_url)
+            console.print(f"[green][+][/green] Ollama OK ({status}) at [cyan]{ollama_url}[/cyan]")
+        except Exception as exc:
+            console.print(f"[red][!] Ollama not reachable at {ollama_url}[/red]")
+            console.print(f"[dim]{exc}[/dim]")
+            console.print("[dim]Use --skip-ai-precheck to run recon anyway.[/dim]")
+            sys.exit(1)
     
     # Run reconnaissance
     try:

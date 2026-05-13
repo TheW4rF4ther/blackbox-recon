@@ -2,10 +2,51 @@
 
 import json
 from abc import ABC, abstractmethod
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 
 import requests
+
+
+def check_local_llm_connection(base_url: str, timeout: float = 10.0) -> Tuple[str, Optional[str]]:
+    """Verify an OpenAI-compatible local server (LM Studio, etc.) is reachable.
+
+    Uses GET ``{base_url}/models`` (same as OpenAI ``/v1/models`` when base ends with ``/v1``).
+
+    Returns ``(status_message, first_model_id_or_none)``.
+
+    Raises:
+        requests.RequestError: connection or HTTP errors
+        ValueError: unexpected response
+    """
+    base = base_url.rstrip("/")
+    url = f"{base}/models"
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict) or "data" not in data:
+        raise ValueError(f"Unexpected /models response from {url!r}")
+    models = data.get("data") or []
+    first_id: Optional[str] = None
+    for entry in models:
+        if isinstance(entry, dict) and entry.get("id"):
+            first_id = str(entry["id"])
+            break
+    status = f"{len(models)} model(s) reported"
+    return status, first_id
+
+
+def check_ollama_connection(base_url: str, timeout: float = 10.0) -> str:
+    """Verify Ollama is reachable (GET ``/api/tags``)."""
+    base = base_url.rstrip("/")
+    url = f"{base}/api/tags"
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict) or "models" not in data:
+        raise ValueError(f"Unexpected /api/tags response from {url!r}")
+    models = data.get("models") or []
+    return f"{len(models)} model(s) available"
 
 
 @dataclass
