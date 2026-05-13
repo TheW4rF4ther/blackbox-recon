@@ -7,6 +7,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from typing import Optional
+
 import click
 from rich.console import Console
 from rich.table import Table
@@ -17,7 +19,6 @@ from .config import Config, create_default_config
 from .recon import ReconEngine
 from .ai_analyzer import (
     AIAnalyzer,
-    AnalysisResult,
     check_local_llm_connection,
     check_ollama_connection,
 )
@@ -28,6 +29,42 @@ for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8", errors="replace")
 
 console = Console()
+
+
+def resolve_report_path(output: Optional[str], target: str, output_format: str) -> Path:
+    """Pick a writable path for reports (avoids PermissionError in protected cwd)."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    default_name = f"{target}-recon-{timestamp}.{output_format}"
+    if not output:
+        path = Path.home() / ".blackbox-recon" / "reports" / default_name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+    path = Path(output).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def write_report_file(path: Path, results: dict, output_format: str) -> Path:
+    """Write report; on PermissionError fall back to ~/.blackbox-recon/reports/."""
+    import json
+
+    def _write(p: Path) -> None:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if output_format == "markdown":
+            generate_markdown_report(results, str(p))
+        else:
+            with p.open("w", encoding="utf-8") as handle:
+                json.dump(results, handle, indent=2)
+
+    try:
+        _write(path)
+        return path
+    except PermissionError:
+        alt = Path.home() / ".blackbox-recon" / "reports" / path.name
+        _write(alt)
+        return alt
 
 
 def print_banner():
@@ -141,6 +178,13 @@ def main(target, config, output, output_format, modules, ai_mode, ai_model,
             console.print(f"[dim]{exc}[/dim]")
             console.print("[dim]Use --skip-ai-precheck to run recon anyway.[/dim]")
             sys.exit(1)
+
+    if ai_mode == "local" and not ai_model:
+        console.print(
+            "[red][!] Local LLM requires a model id. Pass --ai-model, load a model in LM Studio, "
+            "or disable --skip-ai-precheck so /v1/models can be used.[/red]"
+        )
+        sys.exit(1)
     
     # Run reconnaissance
     try:
@@ -218,25 +262,14 @@ def main(target, config, output, output_format, modules, ai_mode, ai_model,
         console.print(table)
         
         # Save results
-        if output:
-            output_file = output
-        else:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = f"{target}-recon-{timestamp}.{output_format}"
-        
-        if output_format == 'json':
-            import json
-            with open(output_file, 'w') as f:
-                json.dump(results, f, indent=2)
-        elif output_format == 'markdown':
-            generate_markdown_report(results, output_file)
-        else:
-            # Default to JSON for now
-            with open(output_file, 'w') as f:
-                import json
-                json.dump(results, f, indent=2)
-        
-        console.print(f"\n[green][+][/green] Results saved to: [cyan]{output_file}[/cyan]")
+        output_path = resolve_report_path(output, target, output_format)
+        written_path = write_report_file(output_path, results, output_format)
+        if written_path != output_path:
+            console.print(
+                f"[yellow][!][/yellow] Could not write to [cyan]{output_path}[/cyan]; "
+                f"saved to [cyan]{written_path}[/cyan] instead."
+            )
+        console.print(f"\n[green][+][/green] Results saved to: [cyan]{written_path}[/cyan]")
         
         # Print some highlights
         if results.get('subdomains'):

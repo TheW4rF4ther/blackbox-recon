@@ -6,6 +6,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 
 import requests
+from requests import HTTPError
 
 
 def check_local_llm_connection(base_url: str, timeout: float = 10.0) -> Tuple[str, Optional[str]]:
@@ -33,7 +34,47 @@ def check_local_llm_connection(base_url: str, timeout: float = 10.0) -> Tuple[st
             first_id = str(entry["id"])
             break
     status = f"{len(models)} model(s) reported"
+    if first_id:
+        probe_url = f"{base}/chat/completions"
+        probe = requests.post(
+            probe_url,
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": first_id,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 8,
+                "temperature": 0,
+                "stream": False,
+            },
+            timeout=min(timeout, 30.0),
+        )
+        if probe.status_code >= 400:
+            raise RuntimeError(
+                f"Chat probe failed ({probe.status_code}) at {probe_url!r}: "
+                f"{(probe.text or '')[:2000]}"
+            )
+    elif not models:
+        raise RuntimeError(
+            "Local LLM /models returned no models. Load a model in LM Studio before running analysis."
+        )
     return status, first_id
+
+
+def shrink_recon_payload_for_llm(recon_data: Dict[str, Any], max_chars: int = 24000) -> str:
+    """Reduce recon JSON size for small local models / LM Studio context limits."""
+    compact: Dict[str, Any] = {
+        "target": recon_data.get("target"),
+        "timestamp": recon_data.get("timestamp"),
+        "summary": recon_data.get("summary", {}),
+        "subdomains": (recon_data.get("subdomains") or [])[:50],
+        "ports": (recon_data.get("ports") or [])[:120],
+        "technologies": (recon_data.get("technologies") or [])[:25],
+    }
+    text = json.dumps(compact, indent=2)
+    if len(text) <= max_chars:
+        return text
+    note = "\n... [payload truncated for local LLM context limits] ...\n"
+    return text[: max_chars - len(note)] + note
 
 
 def check_ollama_connection(base_url: str, timeout: float = 10.0) -> str:
@@ -144,19 +185,22 @@ class LocalProvider(AIProvider):
     
     def analyze(self, recon_data: Dict[str, Any], prompt_template: str) -> str:
         """Analyze with local LLM."""
+        if not self.model:
+            return (
+                "Error calling local LLM: missing model id. "
+                "Pass --ai-model with the exact id from LM Studio, or ensure /v1/models returns a model."
+            )
         try:
             payload = {
+                "model": self.model,
                 "messages": [
                     {"role": "system", "content": "You are a cybersecurity expert specializing in penetration testing and vulnerability analysis."},
-                    {"role": "user", "content": prompt_template + "\n\n" + json.dumps(recon_data, indent=2)}
+                    {"role": "user", "content": prompt_template + "\n\n" + shrink_recon_payload_for_llm(recon_data)},
                 ],
                 "temperature": 0.3,
-                "max_tokens": 4000,
-                "stream": False
+                "max_tokens": 2048,
+                "stream": False,
             }
-            
-            if self.model:
-                payload["model"] = self.model
             
             response = requests.post(
                 f"{self.url}/chat/completions",
@@ -166,6 +210,11 @@ class LocalProvider(AIProvider):
             )
             response.raise_for_status()
             return response.json()["choices"][0]["message"]["content"]
+        except HTTPError as exc:
+            body = ""
+            if exc.response is not None:
+                body = (exc.response.text or "")[:4000]
+            return f"Error calling local LLM: {exc}\nResponse body (truncated):\n{body}"
         except Exception as e:
             return f"Error calling local LLM: {str(e)}"
 
@@ -184,13 +233,13 @@ class OllamaProvider(AIProvider):
                 "model": self.model,
                 "messages": [
                     {"role": "system", "content": "You are a cybersecurity expert specializing in penetration testing and vulnerability analysis."},
-                    {"role": "user", "content": prompt_template + "\n\n" + json.dumps(recon_data, indent=2)}
+                    {"role": "user", "content": prompt_template + "\n\n" + shrink_recon_payload_for_llm(recon_data)},
                 ],
                 "stream": False,
                 "options": {
                     "temperature": 0.3,
-                    "num_predict": 4000
-                }
+                    "num_predict": 2048,
+                },
             }
             
             response = requests.post(
@@ -200,6 +249,11 @@ class OllamaProvider(AIProvider):
             )
             response.raise_for_status()
             return response.json()["message"]["content"]
+        except HTTPError as exc:
+            body = ""
+            if exc.response is not None:
+                body = (exc.response.text or "")[:4000]
+            return f"Error calling Ollama: {exc}\nResponse body (truncated):\n{body}"
         except Exception as e:
             return f"Error calling Ollama: {str(e)}"
 
@@ -249,6 +303,11 @@ Be specific, actionable, and focus on what a penetration tester should prioritiz
             self.provider = ClaudeProvider(api_key, model or "claude-3-sonnet-20240229", temperature, max_tokens)
         
         elif provider == "local":
+            if not model:
+                raise ValueError(
+                    "Local LLM requires a model id. Pass --ai-model with the id shown in LM Studio, "
+                    "or ensure the server returns models from GET /v1/models."
+                )
             self.provider = LocalProvider(url or "http://localhost:1234/v1", model)
         
         elif provider == "ollama":
