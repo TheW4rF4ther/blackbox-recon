@@ -25,14 +25,14 @@ console = Console()
 def print_banner():
     """Print the Blackbox Recon banner."""
     console.print()
-    console.print(r"[bold red]     ____  ____  ____  _   _ ____  ____   [/bold red]")
-    console.print(r"[bold red]    |  _ \|  _ \| __ )| \ | | __ )|  _ \  [/bold red]")
-    console.print(r"[bold red]    | |_) | |_) |  _ \|  \| |  _ \| |_) | [/bold red]")
-    console.print(r"[bold red]    |  _ <|  __/| |_) | |\  | |_) |  _ <  [/bold red]")
-    console.print(r"[bold red]    |_| \_\_|   |____/|_| \_|____/|_| \_\ [/bold red]")
+    console.print(r"[bold bright_red]   _____ ______ _____ ____  _   _ [/bold bright_red]")
+    console.print(r"[bold bright_red]  |  __ \ ___  |  _  / ___|| \ | |[/bold bright_red]")
+    console.print(r"[bold bright_red]  | |__) /   / | | | \___ \|  \| |[/bold bright_red]")
+    console.print(r"[bold bright_red]  |  _  //   \ | | | |___) | |\  |[/bold bright_red]")
+    console.print(r"[bold bright_red]  |_| \_______/ |_____|____/|_| \_|[/bold bright_red]")
     console.print()
-    console.print("[bold yellow]  AI-Augmented Reconnaissance for Penetration Testers[/bold yellow]")
-    console.print("[dim]              by Blackbox Intelligence Group LLC[/dim]")
+    console.print("[bold yellow]  AI-Augmented Reconnaissance for Pentesters[/bold yellow]")
+    console.print("[dim]         by Blackbox Intelligence Group LLC[/dim]")
     console.print()
 
 
