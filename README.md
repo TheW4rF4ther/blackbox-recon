@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/logo.png" alt="Blackbox Recon Logo" width="600">
   
-  # 🔍 Blackbox Recon
+ THIS PLATFORM IS UNDER CONSTRUCTION! PLEASE FEEL FREE TO PULL AND MESS WITH IT AT WILL. I WILL BE UPDATING HEAVILY OVER THE NEXT 2 WEEKS. IF IT TURNS OUT USEFUL, WE WILL CONTINUE DEVELOPMENT
   
   **AI-Augmented Reconnaissance for Penetration Testers**
   
