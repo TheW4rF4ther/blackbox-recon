@@ -83,6 +83,7 @@ def render_triage_dashboard(results: Dict[str, Any]) -> None:
         )
     )
     _render_scan_snapshot(summary, findings, tool_results)
+    _render_open_ports(results)
     _render_tool_results(tool_results)
     _render_vulnerability_signals(findings)
     _render_next_moves(results)
@@ -108,6 +109,27 @@ def _render_scan_snapshot(summary: Dict[str, Any], findings: List[Dict[str, Any]
         str(len(findings)),
         ", ".join(f"{k}:{v}" for k, v in sorted(sev_counts.items())) or "none",
     )
+    console.print(table)
+
+
+def _render_open_ports(results: Dict[str, Any]) -> None:
+    ports = _ports(results)
+    if not ports:
+        return
+    table = Table(title="Open Ports", box=box.ROUNDED, header_style="bold cyan")
+    table.add_column("Host", style="white", no_wrap=True)
+    table.add_column("Port", justify="right", style="bold yellow", no_wrap=True)
+    table.add_column("Service", style="cyan", no_wrap=True)
+    table.add_column("Version / banner", style="bright_white", overflow="fold")
+    table.add_column("State", style="green", no_wrap=True)
+    for port in ports[:30]:
+        table.add_row(
+            str(port.get("host") or ""),
+            str(port.get("port") or ""),
+            str(port.get("service") or "unknown"),
+            _short(port.get("version") or port.get("banner") or "-", 130),
+            str(port.get("state") or "open"),
+        )
     console.print(table)
 
 
