@@ -35,6 +35,41 @@ def _sev_style(sev: str) -> str:
     return "dim cyan"
 
 
+def _status_style(status: str) -> str:
+    status = (status or "").lower()
+    if status in ("ok", "completed", "confirmed", "applied"):
+        return "green"
+    if status in ("skipped", "not_observed", "not applicable"):
+        return "dim"
+    if "error" in status or "fail" in status:
+        return "red"
+    return "yellow"
+
+
+def _signal_badge(signal: str) -> str:
+    low = (signal or "").lower()
+    if "ssh exposed" in low or "web service exposed" in low or "interesting paths found" in low:
+        return "[bold yellow][EXPOSURE][/bold yellow]"
+    if "weak" in low or "missing security headers" in low or "service disclosure" in low:
+        return "[bold red][SIGNAL][/bold red]"
+    if "no flagged" in low or "none observed" in low or "not captured" in low or "no useful" in low:
+        return "[dim][NEGATIVE][/dim]"
+    if "bare ip" in low or "coverage" in low or "screenshot not" in low:
+        return "[bold magenta][LIMITATION][/bold magenta]"
+    return "[dim cyan][INFO][/dim cyan]"
+
+
+def _is_low_signal(row: Dict[str, Any]) -> bool:
+    status = str(row.get("status") or "").lower()
+    signals = " ".join(map(str, row.get("signals") or [])).lower()
+    output = " ".join(map(str, row.get("important_output") or [])).lower()
+    if "error" in status or "fail" in status:
+        return False
+    if any(x in signals or x in output for x in ("ssh exposed", "web service exposed", "weak", "missing security headers", "service disclosure", "interesting paths found", "waf_signal")):
+        return False
+    return any(x in signals or x in output or x in status for x in ("no flagged", "0 interesting", "none observed", "not captured", "skipped", "no useful", "completed/no flagged"))
+
+
 def _findings(results: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [f for f in (results.get("deterministic_findings") or []) if isinstance(f, dict)]
 
@@ -87,6 +122,7 @@ def render_triage_dashboard(results: Dict[str, Any]) -> None:
     _render_tool_results(tool_results)
     _render_vulnerability_signals(findings)
     _render_next_moves(results)
+    _render_tester_takeaway(results)
 
 
 def _render_scan_snapshot(summary: Dict[str, Any], findings: List[Dict[str, Any]], tool_results: List[Dict[str, Any]]) -> None:
@@ -139,22 +175,31 @@ def _render_tool_results(tool_results: List[Dict[str, Any]]) -> None:
     console.print("\n[bold cyan][+] Tool Results[/bold cyan]")
     for row in tool_results:
         title = f"{row.get('id')} · {row.get('tool')} · {row.get('purpose')}"
+        signals = row.get("signals") or []
+        outputs = row.get("important_output") or []
+        status = str(row.get("status") or "unknown")
+        if _is_low_signal(row):
+            first_output = _short(outputs[0] if outputs else "completed/no useful signal", 140)
+            badge = _signal_badge(", ".join(map(str, signals)) or first_output)
+            console.print(f"  {badge} [bold cyan]{row.get('tool')}[/bold cyan]: [{_status_style(status)}]{status}[/] · {first_output}")
+            continue
+
         body = Text()
         cmd = row.get("command") or "not recorded / internal helper"
         body.append("Command: ", style="bold dim")
         body.append(_short(cmd, 180) + "\n", style="dim")
         body.append("Status: ", style="bold dim")
-        body.append(str(row.get("status") or "unknown") + "\n", style="green" if str(row.get("status")).lower() in ("ok", "completed") else "yellow")
-        outputs = row.get("important_output") or []
+        body.append(status + "\n", style=_status_style(status))
         if outputs:
             body.append("Pertinent output:\n", style="bold bright_white")
             for item in outputs[:6]:
                 body.append(f"  - {_short(item, 190)}\n", style="bright_white")
-        signals = row.get("signals") or []
         if signals:
-            body.append("Signals: ", style="bold dim")
-            body.append(", ".join(map(str, signals[:8])), style="yellow")
-        console.print(Panel(body, title=f"[bold cyan]{_short(title, 110)}[/bold cyan]", border_style="cyan", padding=(1, 2)))
+            body.append("Signals:\n", style="bold dim")
+            for sig in signals[:8]:
+                body.append(f"  {_signal_badge(str(sig))} {_short(sig, 160)}\n")
+        border = "red" if _status_style(status) == "red" else "yellow" if signals else "cyan"
+        console.print(Panel(body, title=f"[bold cyan]{_short(title, 110)}[/bold cyan]", border_style=border, padding=(1, 2)))
 
 
 def _render_vulnerability_signals(findings: List[Dict[str, Any]]) -> None:
@@ -185,3 +230,22 @@ def _render_next_moves(results: Dict[str, Any]) -> None:
     for row in moves:
         table.add_row(*row)
     console.print(table)
+
+
+def _render_tester_takeaway(results: Dict[str, Any]) -> None:
+    bullets: List[str] = []
+    if _has_port(results, 80) or _has_port(results, 443):
+        bullets.append("Primary manual path: web testing needs hostname/vhost context for meaningful app discovery.")
+    if _has_port(results, 22):
+        bullets.append("Exposed SSH should be validated for auth policy, hardening, and accepted algorithms.")
+    summary = results.get("summary") or {}
+    if int(summary.get("interesting_paths_found", 0) or 0) == 0:
+        bullets.append("Current content discovery found 0 flagged interesting paths.")
+    if _finding_by_code(results, "BBR-COVERAGE-001"):
+        bullets.append("Bare-IP scope limits subdomain, Host-header, and TLS/SNI reconnaissance quality.")
+    if not bullets:
+        return
+    text = Text()
+    for item in bullets[:5]:
+        text.append(f"- {_short(item, 180)}\n", style="bright_white")
+    console.print(Panel(text, title="[bold green]Tester Takeaway[/bold green]", border_style="green", padding=(1, 2)))
