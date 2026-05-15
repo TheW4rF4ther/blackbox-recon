@@ -7,6 +7,7 @@ WAF/CDN indicators for evidence-backed reporting.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from dataclasses import asdict, dataclass
@@ -28,18 +29,27 @@ class WebFingerprintResult:
 
 def _run_cmd(cmd: List[str], timeout_sec: int) -> Tuple[str, str, int, Optional[str]]:
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=max(5, int(timeout_sec)),
-        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=max(5, int(timeout_sec)))
         return proc.stdout or "", proc.stderr or "", proc.returncode, None
     except subprocess.TimeoutExpired as exc:
         return exc.stdout or "", exc.stderr or "", 124, f"timeout after {timeout_sec}s"
     except Exception as exc:
         return "", "", 1, str(exc)[:500]
+
+
+def _clean_lines(text: str) -> List[str]:
+    lines: List[str] = []
+    for line in (text or "").splitlines():
+        s = " ".join(line.strip().split())
+        if not s:
+            continue
+        # Drop common WAFW00F ASCII art/banner noise.
+        if len(re.sub(r"[A-Za-z0-9]", "", s)) > max(8, len(s) * 0.55):
+            continue
+        if "W00f!" in s or "wafw00f" in s.lower() and "checking" not in s.lower():
+            continue
+        lines.append(s)
+    return lines
 
 
 def run_whatweb(url: str, *, timeout_sec: int = 60) -> Dict[str, Any]:
@@ -49,12 +59,11 @@ def run_whatweb(url: str, *, timeout_sec: int = 60) -> Dict[str, Any]:
     cmd = [exe, "--color=never", "--no-errors", "-a", "3", url]
     stdout, stderr, code, err = _run_cmd(cmd, timeout_sec)
     findings: List[Dict[str, Any]] = []
-    if stdout.strip():
-        # Keep plugin output as inventory evidence; deterministic findings should
-        # not infer vulnerabilities from this alone.
-        findings.append({"type": "whatweb_fingerprint", "summary": stdout.strip()[:2000]})
+    clean = "\n".join(_clean_lines(stdout))
+    if clean.strip():
+        findings.append({"type": "whatweb_fingerprint", "summary": clean.strip()[:1600]})
     status = "ok" if code in (0, 1) and not err else "tool_error"
-    return asdict(WebFingerprintResult(url, "whatweb", "whatweb", " ".join(cmd), status, findings, stdout[-6000:] if stdout else None, stderr[-2000:] if stderr else None, err))
+    return asdict(WebFingerprintResult(url, "whatweb", "whatweb", " ".join(cmd), status, findings, clean[-4000:] if clean else None, stderr[-2000:] if stderr else None, err))
 
 
 def run_wafw00f(url: str, *, timeout_sec: int = 60) -> Dict[str, Any]:
@@ -64,14 +73,35 @@ def run_wafw00f(url: str, *, timeout_sec: int = 60) -> Dict[str, Any]:
     cmd = [exe, "-a", url]
     stdout, stderr, code, err = _run_cmd(cmd, timeout_sec)
     text = (stdout or "") + "\n" + (stderr or "")
-    low = text.lower()
+    clean_lines = _clean_lines(text)
+    clean = "\n".join(clean_lines)
+    low = clean.lower()
     findings: List[Dict[str, Any]] = []
-    if "is behind" in low or "protected by" in low or "waf" in low and "no waf" not in low:
-        findings.append({"type": "waf_signal", "summary": text.strip()[:2000]})
-    elif stdout.strip():
-        findings.append({"type": "waf_scan_completed", "summary": stdout.strip()[:1200]})
+
+    positive = False
+    positive_patterns = [
+        "is behind",
+        "protected by",
+        "detected protection",
+        "the site is behind",
+        "identified as",
+        "generic detection results",
+    ]
+    negative_patterns = [
+        "no waf detected",
+        "does not seem to be behind a waf",
+        "seems to be behind a waf: false",
+        "no firewall detected",
+    ]
+    if any(p in low for p in positive_patterns) and not any(p in low for p in negative_patterns):
+        positive = True
+
+    if positive:
+        findings.append({"type": "waf_signal", "summary": clean[:1600]})
+    elif clean:
+        findings.append({"type": "waf_scan_completed", "summary": clean[:1000]})
     status = "ok" if code in (0, 1) and not err else "tool_error"
-    return asdict(WebFingerprintResult(url, "wafw00f", "wafw00f", " ".join(cmd), status, findings, stdout[-6000:] if stdout else None, stderr[-2000:] if stderr else None, err))
+    return asdict(WebFingerprintResult(url, "wafw00f", "wafw00f", " ".join(cmd), status, findings, clean[-4000:] if clean else None, stderr[-2000:] if stderr else None, err))
 
 
 def run_web_fingerprinting(urls: List[str], *, timeout_sec: int = 60, max_urls: int = 8) -> Dict[str, Any]:
