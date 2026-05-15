@@ -1,4 +1,4 @@
-"""Strict JSON enrichment for local/Ollama models (evidence_package only)."""
+"""Strict JSON enrichment for local/Ollama models using normalized tool results."""
 
 from __future__ import annotations
 
@@ -36,16 +36,17 @@ BAD_AI_PATTERNS = [
 JSON_ENRICHMENT_SYSTEM_PROMPT = (
     "/no_think\n"
     "You are Blackbox Recon Analyst. Return one compact valid JSON object only. "
+    "Analyze only the normalized tool_results provided by the scanner. "
     "No reasoning. No markdown. No prose outside JSON. No drafts. "
-    "Use only the provided evidence. Do not invent CVEs, hosts, paths, services, or exploitability."
+    "Do not invent CVEs, hosts, paths, services, vulnerabilities, or exploitability."
 )
 
 
 LOCAL_JSON_ENRICHMENT_PROMPT = """
 /no_think
 Return ONLY minified JSON using this schema:
-{"executive_summary":"max 2 sentences","risk_narrative":[{"finding_id":"DET-FIND-001","client_ready_text":"1 short sentence","confidence_note":"short note"}],"cve_assessment":{"summary":"short","confirmed_cves":[],"candidate_cves":[],"reasoning_limits":[]},"recommended_next_steps":[{"tool":"tool","objective":"short","prerequisite":"short","example_cli":"tool TARGET","risk_notes":"short"}],"quality_flags":[{"type":"coverage_gap","message":"short"}]}
-Limits: risk_narrative max 3 items, recommended_next_steps max 4 items, every string under 180 chars. Use deterministic_findings only.
+{"executive_summary":"max 2 sentences","risk_narrative":[{"finding_id":"TOOL-001","client_ready_text":"1 short sentence based on tool output","confidence_note":"short note"}],"cve_assessment":{"summary":"short","confirmed_cves":[],"candidate_cves":[],"reasoning_limits":[]},"recommended_next_steps":[{"tool":"tool","objective":"specific validation goal","prerequisite":"short","example_cli":"tool TARGET","risk_notes":"short"}],"quality_flags":[{"type":"coverage_gap","message":"short"}]}
+Rules: use only tool_results and vulnerability_signals. Max 3 risk_narrative items, max 4 next steps, every string under 180 chars.
 """.strip()
 
 
@@ -132,72 +133,83 @@ def parse_ai_enrichment_json(raw: str) -> Tuple[Optional[Dict[str, Any]], Option
     return out, None
 
 
-def _shorten(value: Any, max_len: int = 160) -> Any:
+def _shorten(value: Any, max_len: int = 180) -> Any:
     if isinstance(value, str):
         v = " ".join(value.split())
         return v[: max_len - 3] + "..." if len(v) > max_len else v
     if isinstance(value, list):
-        return value[:6]
+        return value[:8]
     if isinstance(value, dict):
-        return {str(k)[:40]: _shorten(v, 120) for k, v in list(value.items())[:6]}
+        return {str(k)[:40]: _shorten(v, 140) for k, v in list(value.items())[:8]}
     return value
 
 
-def evidence_package_dict_for_llm(recon_data: Dict[str, Any], *, max_evidence: int = 4, max_findings: int = 8) -> Dict[str, Any]:
-    """Return an ultra-compact package for 4K-context local reasoning models."""
-    pkg = recon_data.get("evidence_package")
-    if not isinstance(pkg, dict) or not pkg.get("deterministic_findings"):
-        from .evidence import build_evidence_package
-        eng = recon_data.get("engagement") or {}
-        mods = list(eng.get("modules_requested") or ["subdomain", "portscan", "technology"])
-        lab_mode = not bool(eng.get("record"))
-        pkg = build_evidence_package(recon_data, mods, lab_mode=lab_mode)
+def tool_results_dict_for_llm(recon_data: Dict[str, Any], *, max_tools: int = 10) -> Dict[str, Any]:
+    """Return an ultra-compact package built from normalized tool_results."""
+    from .tool_results import build_tool_results
+
+    raw_tools = build_tool_results(recon_data)
+    tools: List[Dict[str, Any]] = []
+    for t in raw_tools[:max_tools]:
+        if not isinstance(t, dict):
+            continue
+        tools.append(
+            {
+                "id": t.get("id"),
+                "tool": t.get("tool"),
+                "purpose": _shorten(t.get("purpose"), 110),
+                "status": t.get("status"),
+                "assets": list(t.get("assets") or [])[:4],
+                "important_output": [_shorten(x, 170) for x in list(t.get("important_output") or [])[:6]],
+                "signals": [_shorten(x, 90) for x in list(t.get("signals") or [])[:6]],
+            }
+        )
 
     findings = []
-    for f in list(pkg.get("deterministic_findings") or [])[:max_findings]:
-        if isinstance(f, dict):
-            findings.append(
-                {
-                    "id": f.get("id"),
-                    "code": f.get("finding_code"),
-                    "sev": f.get("severity"),
-                    "title": _shorten(f.get("title"), 90),
-                    "assets": list(f.get("affected_assets") or [])[:2],
-                    "evidence_ids": list(f.get("evidence_ids") or [])[:3],
-                }
-            )
-
-    evidence_index = []
-    for e in list(pkg.get("evidence") or [])[:max_evidence]:
-        if not isinstance(e, dict):
+    for f in list(recon_data.get("deterministic_findings") or [])[:8]:
+        if not isinstance(f, dict):
             continue
-        observed = e.get("observed_value") or {}
-        compact = {}
-        if isinstance(observed, dict):
-            for k in ("service", "version", "status_code", "missing_security_headers", "supported_protocols", "weak_signals", "target_type"):
-                if observed.get(k) not in (None, "", [], {}):
-                    compact[k] = _shorten(observed.get(k), 100)
-        evidence_index.append({"id": e.get("id"), "phase": e.get("phase_id"), "type": e.get("observation_type"), "asset": _shorten(e.get("asset"), 90), "observed": compact})
+        code = str(f.get("finding_code") or "")
+        # Keep signals that are not just obvious exposure restatements.
+        if code.startswith("BBR-EXPOSURE"):
+            continue
+        findings.append(
+            {
+                "id": f.get("id"),
+                "code": code,
+                "severity": f.get("severity"),
+                "title": _shorten(f.get("title"), 110),
+                "assets": list(f.get("affected_assets") or [])[:3],
+            }
+        )
 
-    assessment = pkg.get("assessment") or {}
-    summary = assessment.get("summary_metrics") or {}
+    summary = recon_data.get("summary") or {}
     return {
-        "target": assessment.get("target"),
-        "mode": assessment.get("mode"),
-        "metrics": summary,
-        "findings": findings,
-        "coverage_notes": list(pkg.get("coverage_notes") or [])[:4],
-        "evidence_index": evidence_index,
+        "target": recon_data.get("target"),
+        "summary": {
+            "open_ports": summary.get("total_open_ports", summary.get("open_tcp_ports", 0)),
+            "http_services": summary.get("http_services_detected", 0),
+            "content_hits": summary.get("interesting_paths_found", 0),
+            "tools": len(raw_tools),
+        },
+        "tool_results": tools,
+        "vulnerability_signals": findings,
+        "instruction": "Recommend technical validation paths only from these tool_results. If evidence is insufficient, say so.",
     }
 
 
-def evidence_package_json_for_llm(recon_data: Dict[str, Any], max_chars: int = 2600) -> str:
-    for max_findings, max_evidence in ((8, 4), (6, 2), (4, 0)):
-        pkg = evidence_package_dict_for_llm(recon_data, max_evidence=max_evidence, max_findings=max_findings)
+def evidence_package_dict_for_llm(recon_data: Dict[str, Any], *, max_evidence: int = 4, max_findings: int = 8) -> Dict[str, Any]:
+    """Compatibility wrapper: AI now receives normalized tool_results, not evidence_package."""
+    return tool_results_dict_for_llm(recon_data)
+
+
+def evidence_package_json_for_llm(recon_data: Dict[str, Any], max_chars: int = 3000) -> str:
+    for max_tools in (10, 8, 6, 4):
+        pkg = tool_results_dict_for_llm(recon_data, max_tools=max_tools)
         text = json.dumps(pkg, separators=(",", ":"), ensure_ascii=False)
         if len(text) <= max_chars:
             return text
-    pkg = evidence_package_dict_for_llm(recon_data, max_evidence=0, max_findings=3)
+    pkg = tool_results_dict_for_llm(recon_data, max_tools=3)
     return json.dumps(pkg, separators=(",", ":"), ensure_ascii=False)[:max_chars]
 
 
@@ -208,7 +220,7 @@ def format_enrichment_markdown(enrichment: Dict[str, Any]) -> str:
         parts.append("### Executive summary (enrichment)\n\n" + ex + "\n")
     rn = enrichment.get("risk_narrative") or []
     if rn:
-        parts.append("### Risk narrative (by finding)\n\n")
+        parts.append("### Risk narrative (by tool result)\n\n")
         for item in rn[:3]:
             if not isinstance(item, dict):
                 continue
