@@ -1,16 +1,18 @@
 """Post-scan posture and service enrichment hook for ReconEngine.
 
-This module wires M6-M10 enrichment into the existing run loop without changing
+This module wires M6-M11 enrichment into the existing run loop without changing
 the scanner's core phases. It is intentionally observational: it runs HTTP
 header sampling, TLS posture sampling, service-specific enumeration, web
-fingerprinting, and DNS enrichment only against assets discovered by the current
-run, then refreshes the evidence package and deterministic findings.
+fingerprinting, DNS enrichment, and optional screenshot triage only against
+assets discovered by the current run, then refreshes the evidence package and
+deterministic findings.
 """
 
 from __future__ import annotations
 
 import asyncio
 from functools import partial
+from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 from rich import print as rprint
@@ -20,6 +22,7 @@ from .dns_enum import run_dns_enrichment
 from .evidence import build_evidence_package
 from .http_headers import HttpHeaderAnalyzer
 from .reporting import build_executive_snapshot, utc_now_iso
+from .screenshots import run_screenshot_triage
 from .service_enum import run_service_enumeration
 from .tls_scan import scan_tls_url
 from .web_fingerprint import run_web_fingerprinting
@@ -192,6 +195,30 @@ async def _run_dns_enrichment(engine: Any, results: Dict[str, Any], target: str)
     rprint(f"  → Phase complete (completed): {dns.get('queries_run', 0)} DNS query/queries executed")
 
 
+async def _run_screenshot_triage(engine: Any, results: Dict[str, Any], urls: List[str], target: str) -> None:
+    if not bool(getattr(engine, "config", {}).get("screenshot_enabled", True)):
+        _trace_append(results, phase_id="M11", phase_name="Screenshot triage", status="skipped", detail="screenshot_enabled is false", stack_lines=["Stack: gowitness when installed"], commands=[])
+        return
+    rprint("\n────────────────────────────────────────────────────────────────────────")
+    rprint("  PTES M11 · Screenshot triage")
+    rprint("  Intelligence Gathering › Visual web service triage")
+    rprint("────────────────────────────────────────────────────────────────────────")
+    rprint("    · Objective: Capture screenshots of discovered HTTP(S) services for operator triage.")
+    rprint("    · Stack: gowitness when installed; skipped gracefully when missing")
+    base = Path.home() / ".blackbox-recon" / "screenshots" / str(target).replace("/", "_")
+    timeout = int(getattr(engine, "config", {}).get("screenshot_timeout_sec", 90) or 90)
+    loop = asyncio.get_running_loop()
+    ss = await loop.run_in_executor(None, partial(run_screenshot_triage, urls, output_dir=str(base), timeout_sec=timeout, max_urls=len(urls) or 1))
+    results["screenshot_triage"] = ss
+    commands: List[Dict[str, Any]] = []
+    for row in ss.get("results") or []:
+        cmd = row.get("command") or f"{row.get('tool')} skipped"
+        rprint(f"     screenshot: {escape(str(cmd))}")
+        commands.append({"label": "screenshot", "command": cmd, "url": row.get("url"), "status": row.get("status"), "path": row.get("screenshot_path")})
+    _trace_append(results, phase_id="M11", phase_name="Screenshot triage", status="completed", detail=f"{ss.get('screenshots_captured', 0)} screenshot(s) captured across {ss.get('urls_considered', 0)} URL(s)", stack_lines=["Stack: gowitness when installed"], commands=commands)
+    rprint(f"  → Phase complete (completed): {ss.get('screenshots_captured', 0)} screenshot(s) captured")
+
+
 def _service_findings(results: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     rows = (results.get("service_enumeration") or {}).get("results") or []
@@ -242,6 +269,8 @@ def _web_dns_findings(results: Dict[str, Any]) -> List[Dict[str, Any]]:
             dns_records.extend(row.get("records") or [])
     if dns_records:
         _add("BBR-DNS-INFO-001", "DNS record inventory observed", "informational", str(dns.get("target") or "target"), "DNS-ENUM-001", "DNS records provide external attack-surface inventory and may reveal hosting, mail, or certificate-control dependencies.", "Review DNS record inventory for stale records, unintended exposure, and policy controls such as SPF/DMARC/CAA when applicable.", "Re-run DNS enrichment and compare records to the authoritative asset inventory.", "medium")
+    if int((results.get("screenshot_triage") or {}).get("screenshots_captured") or 0) > 0:
+        _add("BBR-WEB-SCREEN-001", "Web screenshots captured for triage", "informational", "web", "SCREENSHOT-TRIAGE-001", "Screenshots provide visual triage evidence for exposed web services and help prioritize manual review.", "Review captured screenshots for login panels, admin interfaces, default pages, and exposed application context.", "Open screenshot paths listed in screenshot_triage results and confirm pages match expected services.", "high")
     return out
 
 
@@ -252,7 +281,8 @@ def _refresh_summary_and_evidence(engine: Any, results: Dict[str, Any], modules:
     summary["service_enum_modules_run"] = int((results.get("service_enumeration") or {}).get("modules_run") or 0)
     summary["web_fingerprint_modules_run"] = int((results.get("web_fingerprinting") or {}).get("modules_run") or 0)
     summary["dns_record_queries_run"] = int((results.get("dns_record_enrichment") or {}).get("queries_run") or 0)
-    modules_executed = list(dict.fromkeys(list(modules) + ["http_headers", "tls", "service_enum", "web_fingerprint", "dns_enrichment"]))
+    summary["screenshots_captured"] = int((results.get("screenshot_triage") or {}).get("screenshots_captured") or 0)
+    modules_executed = list(dict.fromkeys(list(modules) + ["http_headers", "tls", "service_enum", "web_fingerprint", "dns_enrichment", "screenshot_triage"]))
     results["evidence_package"] = build_evidence_package(results, modules_executed, lab_mode=getattr(engine, "_rt", None) is None)
     base_findings = list(results["evidence_package"].get("deterministic_findings", []))
     results["deterministic_findings"] = base_findings
@@ -264,6 +294,7 @@ def _refresh_summary_and_evidence(engine: Any, results: Dict[str, Any], modules:
     results["evidence_package"].setdefault("service_enumeration", results.get("service_enumeration") or {})
     results["evidence_package"].setdefault("web_fingerprinting", results.get("web_fingerprinting") or {})
     results["evidence_package"].setdefault("dns_record_enrichment", results.get("dns_record_enrichment") or {})
+    results["evidence_package"].setdefault("screenshot_triage", results.get("screenshot_triage") or {})
     results["deterministic_attack_paths"] = results["evidence_package"].get("deterministic_attack_paths", [])
     results["recon_completed_utc"] = utc_now_iso()
     results["executive_snapshot"] = build_executive_snapshot(results)
@@ -281,9 +312,10 @@ async def _posture_enriched_run(engine: Any, original_run: Any, target: str, mod
     await _run_service_enrichment(engine, results)
     await _run_web_fingerprint_enrichment(engine, results, urls)
     await _run_dns_enrichment(engine, results, target)
+    await _run_screenshot_triage(engine, results, urls, target)
     _refresh_summary_and_evidence(engine, results, modules)
     rprint("\n[bold green][+][/bold green] Service and web posture enrichment complete")
-    rprint(f"    [yellow]HTTP header URLs:[/yellow] [white]{results['summary'].get('http_header_urls_analyzed', 0)}[/white]  [yellow]TLS services:[/yellow] [white]{results['summary'].get('tls_services_analyzed', 0)}[/white]  [yellow]Service modules:[/yellow] [white]{results['summary'].get('service_enum_modules_run', 0)}[/white]  [yellow]Web FP modules:[/yellow] [white]{results['summary'].get('web_fingerprint_modules_run', 0)}[/white]  [yellow]DNS queries:[/yellow] [white]{results['summary'].get('dns_record_queries_run', 0)}[/white]")
+    rprint(f"    [yellow]HTTP header URLs:[/yellow] [white]{results['summary'].get('http_header_urls_analyzed', 0)}[/white]  [yellow]TLS services:[/yellow] [white]{results['summary'].get('tls_services_analyzed', 0)}[/white]  [yellow]Service modules:[/yellow] [white]{results['summary'].get('service_enum_modules_run', 0)}[/white]  [yellow]Web FP modules:[/yellow] [white]{results['summary'].get('web_fingerprint_modules_run', 0)}[/white]  [yellow]DNS queries:[/yellow] [white]{results['summary'].get('dns_record_queries_run', 0)}[/white]  [yellow]Screenshots:[/yellow] [white]{results['summary'].get('screenshots_captured', 0)}[/white]")
     return results
 
 
