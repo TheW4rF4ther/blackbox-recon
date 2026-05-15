@@ -114,18 +114,40 @@ def write_report_file(path: Path, results: dict, output_format: str) -> Path:
         return alt
 
 
+BANNER_ART = r"""
+  ____  __           __   ____
+ / __ )/ /___ ______/ /__/ __ )____  _  __
+/ __  / / __ `/ ___/ //_/ __  / __ \| |/_/
+/ /_/ / / /_/ / /__/ ,< / /_/ / /_/ />  <
+\____/_/\__,_/\___/_/|_/_____/\____/_/|_|
+
+   ____  ______ _________  _   __
+  / __ \/ ____// ____/ _ \| | / /
+ / /_/ / __/  / /   / // /| |/ /
+/ _, _/ /___ / /___/ __  / |   /
+/_/ |_/_____/ \____/_/ /_/  |_|_|
+""".strip("\n")
+
+
 def print_banner():
     """Print the Blackbox Recon banner."""
-    o = "[bold #d94a34]"
-    c = "[/bold #d94a34]"
+    banner = Text()
+    banner.append(BANNER_ART, style="bold #d94a34")
+    banner.append("\n\n")
+    banner.append("AI-Augmented Reconnaissance for Pentesters", style="bold bright_white")
+    banner.append("\n")
+    banner.append("by Blackbox Intelligence Group LLC", style="dim")
+
     console.print()
-    console.print(rf"{o} ___  ___  ___  ___  _  _ {c}")
-    console.print(rf"{o}| _ \| __|/ __|/ _ \| \| |{c}")
-    console.print(rf"{o}|   /| _|| (__| (_) | .` |{c}")
-    console.print(rf"{o}|_|_\|___|\___|\___/|_|\_|{c}")
-    console.print()
-    console.print("[bold yellow]  AI-Augmented Reconnaissance for Pentesters[/bold yellow]")
-    console.print("[dim]         by Blackbox Intelligence Group LLC[/dim]")
+    console.print(
+        Panel(
+            banner,
+            title="[bold #d94a34]Blackbox Recon[/bold #d94a34]",
+            subtitle="[dim]Evidence-driven reconnaissance[/dim]",
+            border_style="#d94a34",
+            padding=(1, 2),
+        )
+    )
     console.print()
 
 
@@ -522,7 +544,6 @@ def recon_main(
                             )
                         )
 
-                # Add analysis to results
                 results['ai_analysis'] = {
                     'executive_summary': analysis.executive_summary,
                     'technical_analysis': analysis.technical_analysis,
@@ -537,43 +558,22 @@ def recon_main(
                 }
 
                 if analysis.recommended_next_steps:
-                    console.print(
-                        "\n[bold cyan]AI — recommended follow-up tools[/bold cyan] "
-                        "[dim](advisory only; Blackbox Recon does not run these)[/dim]"
-                    )
-                    nst = Table(
-                        title="[bold cyan]Suggested next moves[/bold cyan]",
-                        box=box.ROUNDED,
-                        header_style="bold yellow",
-                    )
+                    console.print("\n[bold cyan]AI — recommended follow-up tools[/bold cyan] [dim](advisory only; Blackbox Recon does not run these)[/dim]")
+                    nst = Table(title="[bold cyan]Suggested next moves[/bold cyan]", box=box.ROUNDED, header_style="bold yellow")
                     nst.add_column("Tool", style="bold cyan", max_width=18)
                     nst.add_column("Objective", style="white", max_width=36)
                     nst.add_column("Example CLI (placeholders)", style="dim cyan", max_width=44)
                     for row in analysis.recommended_next_steps[:8]:
-                        nst.add_row(
-                            row.get("tool", "—") or "—",
-                            (row.get("objective") or "—")[:200],
-                            (row.get("example_cli") or "—")[:200],
-                        )
+                        nst.add_row(row.get("tool", "—") or "—", (row.get("objective") or "—")[:200], (row.get("example_cli") or "—")[:200])
                     console.print(nst)
-                    console.print(
-                        "[dim]Validate against ROE/scope before running any command. "
-                        "Prefer engagement-gated runs and your own wordlists/paths.[/dim]"
-                    )
-                
+                    console.print("[dim]Validate against ROE/scope before running any command. Prefer engagement-gated runs and your own wordlists/paths.[/dim]")
             except Exception as e:
                 console.print(f"[yellow][!] AI analysis failed: {e}[/yellow]")
         
-        # Display summary table
         console.print("\n[bold green]Reconnaissance Summary[/bold green]")
-        table = Table(
-            title="[bold yellow]Counts[/bold yellow]",
-            box=box.ROUNDED,
-            header_style="bold cyan",
-        )
+        table = Table(title="[bold yellow]Counts[/bold yellow]", box=box.ROUNDED, header_style="bold cyan")
         table.add_column("Metric", style="yellow")
         table.add_column("Count", style="bold white", justify="right")
-        
         summary = results.get('summary', {})
         table.add_row("Subdomains found", str(summary.get('total_subdomains', 0)))
         table.add_row("Open TCP ports", str(summary.get('open_tcp_ports', summary.get('total_open_ports', 0))))
@@ -581,23 +581,17 @@ def recon_main(
         table.add_row("Subdomain HTTP probes w/ status", str(summary.get('subdomain_http_probes_with_status', summary.get('web_services', 0))))
         table.add_row("HTTP URLs targeted (dir / content)", str(summary.get('http_urls_targeted', summary.get('web_urls_targeted', 0))))
         table.add_row("Technology profiles stored", str(summary.get('technology_profiles_stored', summary.get('total_tech_detected', 0))))
-        
         console.print(table)
 
         results["technical_report_markdown"] = render_technical_assessment_markdown(results)
 
-        # Save results
         ws_reports = engagement_rt.paths["reports"] if engagement_rt else None
         output_path = resolve_report_path(output, target, output_format, workspace_reports=ws_reports)
         written_path = write_report_file(output_path, results, output_format)
         if written_path != output_path:
-            console.print(
-                f"[yellow][!][/yellow] Could not write to [cyan]{output_path}[/cyan]; "
-                f"saved to [cyan]{written_path}[/cyan] instead."
-            )
+            console.print(f"[yellow][!][/yellow] Could not write to [cyan]{output_path}[/cyan]; saved to [cyan]{written_path}[/cyan] instead.")
         console.print(f"\n[green][+][/green] Results saved to: [cyan]{written_path}[/cyan]")
         
-        # Print some highlights
         if results.get('subdomains'):
             console.print("\n[bold yellow]Top Subdomains:[/bold yellow]")
             for sub in results['subdomains'][:5]:
@@ -616,12 +610,9 @@ def recon_main(
                 line = f"{port['port']}/{port.get('service', '?')}{ver}"
                 if line not in ports_by_host[host]:
                     ports_by_host[host].append(line)
-            
             for host, ports in list(ports_by_host.items())[:3]:
                 console.print(f"  - {host}: {', '.join(ports[:5])}")
-        
         console.print("\n[dim]Done. Stay safe, hack ethically.[/dim]")
-        
     except KeyboardInterrupt:
         console.print("\n[yellow][!] Interrupted by user[/yellow]")
         sys.exit(0)
@@ -634,22 +625,9 @@ def recon_main(
 
 
 @click.command()
-@click.option(
-    "--config",
-    "-c",
-    type=click.Path(exists=True, dir_okay=False),
-    help="YAML config (uses recon.* to decide which tools are required)",
-)
-@click.option(
-    "--install",
-    is_flag=True,
-    help="Run apt-get install for missing packages (non-interactive sudo required)",
-)
-@click.option(
-    "--apt-update",
-    is_flag=True,
-    help="Run apt-get update before install (slower)",
-)
+@click.option("--config", "-c", type=click.Path(exists=True, dir_okay=False), help="YAML config (uses recon.* to decide which tools are required)")
+@click.option("--install", is_flag=True, help="Run apt-get install for missing packages (non-interactive sudo required)")
+@click.option("--apt-update", is_flag=True, help="Run apt-get update before install (slower)")
 def kali_setup_command(config: Optional[str], install: bool, apt_update: bool):
     """Verify Kali/Debian external CLIs and optionally install missing apt packages."""
     print_banner()
@@ -672,11 +650,7 @@ def kali_setup_command(config: Optional[str], install: bool, apt_update: bool):
         "kali_apt_update_before_install": apt_update,
         "kali_report_missing_tools": cfg.recon.kali_report_missing_tools,
     }
-    snap, err = ensure_kali_toolchain(
-        recon_cfg,
-        auto_install=install,
-        apt_update_first=apt_update,
-    )
+    snap, err = ensure_kali_toolchain(recon_cfg, auto_install=install, apt_update_first=apt_update)
     console.print("\n[bold cyan]Platform[/bold cyan]")
     console.print(f"  Kali: {snap.get('is_kali')} | Debian-like: {snap.get('is_debian_like')}")
     tbl = Table(title="External tools (PATH)", box=box.ROUNDED)
@@ -684,21 +658,14 @@ def kali_setup_command(config: Optional[str], install: bool, apt_update: bool):
     tbl.add_column("Present", style="magenta")
     tbl.add_column("Path", style="dim")
     for name, row in (snap.get("tools") or {}).items():
-        tbl.add_row(
-            name,
-            "yes" if row.get("present") else "no",
-            row.get("path") or "",
-        )
+        tbl.add_row(name, "yes" if row.get("present") else "no", row.get("path") or "")
     console.print(tbl)
 
     miss = snap.get("missing_apt_packages") or []
     if miss:
         console.print(f"\n[yellow][!][/yellow] Missing packages for current recon config: [cyan]{' '.join(miss)}[/cyan]")
         if not install:
-            console.print(
-                "[dim]Re-run with --install to apt-get install (requires passwordless sudo), "
-                "or: sudo apt-get install -y " + " ".join(miss) + "[/dim]"
-            )
+            console.print("[dim]Re-run with --install to apt-get install (requires passwordless sudo), or: sudo apt-get install -y " + " ".join(miss) + "[/dim]")
     else:
         console.print("\n[green][+][/green] All required external tools for this config are on PATH.")
 
@@ -712,7 +679,6 @@ def kali_setup_command(config: Optional[str], install: bool, apt_update: bool):
     for ph in meth.get("phases") or []:
         st = "[green]ready[/green]" if ph.get("ready") else "[yellow]not ready[/yellow]"
         console.print(f"  {ph.get('phase_id')} {ph.get('name')}: {st} — {ph.get('detail')}")
-
     console.print("\n[dim]Tip: methodology phases depend on --modules on real recon runs.[/dim]")
 
 
@@ -732,7 +698,6 @@ def generate_markdown_report(results: dict, output_file: str):
         f.write(f"**Schema:** {results.get('schema_version', '1.0')}  \n")
         f.write(f"**Generated:** {results.get('timestamp', '')}  \n")
         f.write(f"**Completed (UTC):** {results.get('recon_completed_utc', '')}\n\n")
-
         f.write(render_technical_assessment_markdown(results))
         f.write("\n---\n\n## Appendices\n\n")
 
@@ -751,19 +716,13 @@ def generate_markdown_report(results: dict, output_file: str):
             f.write("### Recon methodology (phase readiness)\n\n")
             for ph in phases:
                 ok = ph.get("ready")
-                f.write(
-                    f"- **{ph.get('phase_id')} {ph.get('name')}** — "
-                    f"{'ready' if ok else 'not ready'}: {ph.get('detail')}\n"
-                )
+                f.write(f"- **{ph.get('phase_id')} {ph.get('name')}** — {'ready' if ok else 'not ready'}: {ph.get('detail')}\n")
             f.write("\n")
 
         trace = results.get("recon_phase_trace") or []
         if trace:
             f.write("### PTES-style execution trace (what ran)\n\n")
-            f.write(
-                "Per-phase log of tooling: Python stack vs external binaries (`nmap`, `nslookup`, "
-                "`gobuster`/`dirb`). Each `command` value is the exact line executed where applicable.\n\n"
-            )
+            f.write("Per-phase log of tooling: Python stack vs external binaries (`nmap`, `nslookup`, `gobuster`/`dirb`). Each `command` value is the exact line executed where applicable.\n\n")
             for row in trace:
                 f.write(f"### {row.get('phase_id')} — {row.get('phase_name')}\n\n")
                 f.write(f"- **Status:** {row.get('status')}  \n")
@@ -792,10 +751,7 @@ def generate_markdown_report(results: dict, output_file: str):
             if snap.get("http_services_detected") is not None:
                 f.write(f"- **HTTP(S) services (from ports):** {snap.get('http_services_detected', 0)}\n")
             if snap.get("subdomain_http_probes_with_status") is not None:
-                f.write(
-                    f"- **Subdomain HTTP probes w/ status:** "
-                    f"{snap.get('subdomain_http_probes_with_status', 0)}\n"
-                )
+                f.write(f"- **Subdomain HTTP probes w/ status:** {snap.get('subdomain_http_probes_with_status', 0)}\n")
             if snap.get("dns_names_observed"):
                 f.write(f"- **DNS names observed:** {', '.join(snap['dns_names_observed'][:15])}\n")
             f.write("\n")
@@ -820,10 +776,7 @@ def generate_markdown_report(results: dict, output_file: str):
             f.write("### Nmap (per host)\n\n")
             for h in per_host:
                 f.write(f"- **{h.get('host')}:** `{h.get('command')}`  \n")
-                f.write(
-                    f"  - XML parseable: {h.get('xml_parseable')} | "
-                    f"Open ports in XML: {h.get('open_ports_in_xml')}\n"
-                )
+                f.write(f"  - XML parseable: {h.get('xml_parseable')} | Open ports in XML: {h.get('open_ports_in_xml')}\n")
             f.write("\n")
 
         ai = results.get("ai_analysis") or {}
@@ -831,44 +784,29 @@ def generate_markdown_report(results: dict, output_file: str):
             st = str(ai.get("ai_status") or "ok")
             ta_body = (ai.get("technical_analysis") or "").strip()
             steps = ai.get("recommended_next_steps") or []
-
             if st == "applied" and ta_body:
                 f.write("### Structured AI enrichment\n\n")
-                f.write(
-                    "*Parsed from model JSON output. Deterministic findings in the technical assessment remain authoritative.*\n\n"
-                )
+                f.write("*Parsed from model JSON output. Deterministic findings in the technical assessment remain authoritative.*\n\n")
                 f.write(ta_body + "\n\n")
             elif st == "ok" and ta_body:
                 f.write("### Narrative enrichment (model-generated)\n\n")
-                f.write(
-                    "*Optional model prose for triage context only; it does not supersede deterministic evidence.*\n\n"
-                )
+                f.write("*Optional model prose for triage context only; it does not supersede deterministic evidence.*\n\n")
                 f.write(ta_body + "\n\n")
             elif st not in ("ok", "applied") and ta_body:
                 f.write("### AI enrichment status\n\n")
                 f.write(ta_body + "\n\n")
                 if ai.get("ai_discard_reason"):
                     f.write(f"- **Detail:** `{ai['ai_discard_reason']}`\n\n")
-
             if steps:
                 f.write("### AI — advisory next moves (not executed)\n\n")
-                f.write(
-                    "These are model-suggested follow-ups only. Validate against ROE/scope before running.\n\n"
-                )
+                f.write("These are model-suggested follow-ups only. Validate against ROE/scope before running.\n\n")
                 f.write("| Tool | Objective | Example CLI | Risk notes |\n")
                 f.write("|------|-------------|-------------|------------|\n")
-
                 def _md_cell(s: str, max_len: int = 120) -> str:
                     t = (s or "").replace("|", "\\|").replace("\n", " ")
                     return (t[: max_len - 3] + "...") if len(t) > max_len else t
-
                 for row in steps[:8]:
-                    f.write(
-                        f"| {_md_cell(str(row.get('tool', '')))} | "
-                        f"{_md_cell(str(row.get('objective', '')))} | "
-                        f"{_md_cell(str(row.get('example_cli', '')), 160)} | "
-                        f"{_md_cell(str(row.get('risk_notes', '')))} |\n"
-                    )
+                    f.write(f"| {_md_cell(str(row.get('tool', '')))} | {_md_cell(str(row.get('objective', '')))} | {_md_cell(str(row.get('example_cli', '')), 160)} | {_md_cell(str(row.get('risk_notes', '')))} |\n")
                 f.write("\n")
 
         if results.get("subdomains"):
@@ -889,9 +827,7 @@ def generate_markdown_report(results: dict, output_file: str):
                 ver = (port.get("version") or "").replace("|", "\\|")
                 if len(ver) > 120:
                     ver = ver[:117] + "..."
-                f.write(
-                    f"| {port['host']} | {port['port']} | {port.get('service', 'unknown')} | {ver} |\n"
-                )
+                f.write(f"| {port['host']} | {port['port']} | {port.get('service', 'unknown')} | {ver} |\n")
             f.write("\n")
 
         web = results.get("web_content_discovery") or {}
