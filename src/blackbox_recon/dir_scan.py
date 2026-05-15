@@ -1,4 +1,9 @@
-"""Web path discovery via gobuster or dirb when available."""
+"""Web path discovery via Kali-native content discovery tools.
+
+Auto mode prefers stronger modern tooling when present:
+feroxbuster -> ffuf -> gobuster -> dirsearch -> dirb.
+The returned structure remains stable for the Blackbox Recon dashboard/report.
+"""
 
 from __future__ import annotations
 
@@ -16,20 +21,18 @@ def default_bundled_wordlist() -> Path:
     return Path(__file__).resolve().parent / "data" / "web_discovery_small.txt"
 
 
-# Typical locations on Kali / Parrot when optional wordlists are installed.
 _KALI_DIR_WORDLIST_CANDIDATES: Tuple[str, ...] = (
-    "/usr/share/wordlists/dirb/common.txt",
+    "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt",
+    "/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt",
+    "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-small.txt",
     "/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt",
     "/usr/share/seclists/Discovery/Web-Content/common.txt",
+    "/usr/share/wordlists/dirb/common.txt",
     "/usr/share/wordlists/dirb/big.txt",
 )
 
 
 def resolve_directory_wordlist(explicit: Optional[str] = None) -> Path:
-    """
-    Pick a directory wordlist: explicit config, then ``BLACKBOX_RECON_DIR_WORDLIST``,
-    then first existing Kali-style path, else the bundled small list.
-    """
     if explicit:
         p = Path(explicit).expanduser()
         if p.is_file():
@@ -46,20 +49,34 @@ def resolve_directory_wordlist(explicit: Optional[str] = None) -> Path:
     return default_bundled_wordlist()
 
 
+def _which(name: str) -> Optional[str]:
+    return shutil.which(name)
+
+
 def find_gobuster() -> Optional[str]:
-    return shutil.which("gobuster")
+    return _which("gobuster")
 
 
 def find_dirb() -> Optional[str]:
-    return shutil.which("dirb")
+    return _which("dirb")
 
 
-_GOBLINE = re.compile(r"^\s*(/[^\s]*)\s+\(Status:\s*(\d{3})\)\s*$")
+_GOBLINE = re.compile(r"^\s*(/[^\s]*)\s+\(Status:\s*(\d{3})\)(?:\s+\[Size:\s*(\d+)\])?.*$")
 _DIRB_LINE = re.compile(r"^\s*\+\s+(https?://\S+)\s+\(CODE:(\d+)\|")
+_FEROX_LINE = re.compile(r"^\s*(\d{3})\s+\S+\s+\S+\s+\S+\s+(https?://\S+)")
+_FFUF_LINE = re.compile(r"^\s*([^\s]+)\s+\[Status:\s*(\d{3}),\s*Size:\s*(\d+),.*\]")
+_DIRSEARCH_LINE = re.compile(r"^\s*(\d{3})\s+-\s+\S+\s+-\s+(https?://\S+)")
 
 
 def _interesting_status(code: int) -> bool:
     return code in (200, 201, 202, 204, 301, 302, 307, 308, 401, 403, 405, 500, 502)
+
+
+def _path_from_url(url: str) -> str:
+    try:
+        return urlparse(url).path or "/"
+    except Exception:
+        return url
 
 
 def _parse_gobuster_lines(lines: List[str]) -> List[Dict[str, Any]]:
@@ -68,14 +85,8 @@ def _parse_gobuster_lines(lines: List[str]) -> List[Dict[str, Any]]:
         m = _GOBLINE.match(line.strip())
         if not m:
             continue
-        path, sc = m.group(1), int(m.group(2))
-        hits.append(
-            {
-                "path": path,
-                "status_code": sc,
-                "interesting": _interesting_status(sc),
-            }
-        )
+        path, sc, size = m.group(1), int(m.group(2)), m.group(3)
+        hits.append({"path": path, "status_code": sc, "size": int(size) if size else None, "interesting": _interesting_status(sc)})
     return hits
 
 
@@ -90,32 +101,59 @@ def _parse_dirb_lines(lines: List[str]) -> List[Dict[str, Any]]:
             code = int(code_s)
         except ValueError:
             continue
-        try:
-            path = urlparse(url).path or "/"
-        except Exception:
-            path = url
-        hits.append(
-            {
-                "path": path,
-                "url": url,
-                "status_code": code,
-                "interesting": _interesting_status(code),
-            }
-        )
+        hits.append({"path": _path_from_url(url), "url": url, "status_code": code, "interesting": _interesting_status(code)})
+    return hits
+
+
+def _parse_ferox_lines(lines: List[str]) -> List[Dict[str, Any]]:
+    hits: List[Dict[str, Any]] = []
+    for line in lines:
+        m = _FEROX_LINE.match(line.strip())
+        if not m:
+            continue
+        code, url = int(m.group(1)), m.group(2)
+        hits.append({"path": _path_from_url(url), "url": url, "status_code": code, "interesting": _interesting_status(code)})
+    return hits
+
+
+def _parse_ffuf_lines(lines: List[str], base_url: str) -> List[Dict[str, Any]]:
+    hits: List[Dict[str, Any]] = []
+    for line in lines:
+        m = _FFUF_LINE.match(line.strip())
+        if not m:
+            continue
+        word, code_s, size_s = m.group(1), m.group(2), m.group(3)
+        code = int(code_s)
+        path = "/" + word.strip("/")
+        hits.append({"path": path, "url": base_url.rstrip("/") + path, "status_code": code, "size": int(size_s), "interesting": _interesting_status(code)})
+    return hits
+
+
+def _parse_dirsearch_lines(lines: List[str]) -> List[Dict[str, Any]]:
+    hits: List[Dict[str, Any]] = []
+    for line in lines:
+        m = _DIRSEARCH_LINE.match(line.strip())
+        if not m:
+            continue
+        code, url = int(m.group(1)), m.group(2)
+        hits.append({"path": _path_from_url(url), "url": url, "status_code": code, "interesting": _interesting_status(code)})
     return hits
 
 
 def _pick_tool(preference: str) -> Tuple[str, Optional[str]]:
     pref = (preference or "auto").strip().lower()
-    gb, db = find_gobuster(), find_dirb()
-    if pref == "gobuster":
-        return ("gobuster", gb)
-    if pref == "dirb":
-        return ("dirb", db)
-    if gb:
-        return ("gobuster", gb)
-    if db:
-        return ("dirb", db)
+    tools = {
+        "feroxbuster": _which("feroxbuster"),
+        "ffuf": _which("ffuf"),
+        "gobuster": _which("gobuster"),
+        "dirsearch": _which("dirsearch"),
+        "dirb": _which("dirb"),
+    }
+    if pref in tools:
+        return (pref, tools[pref])
+    for name in ("feroxbuster", "ffuf", "gobuster", "dirsearch", "dirb"):
+        if tools.get(name):
+            return (name, tools[name])
     return ("none", None)
 
 
@@ -127,91 +165,47 @@ def run_directory_scan(
     threads: int = 10,
     timeout_sec: int = 900,
 ) -> Dict[str, Any]:
-    """
-    Run gobuster (preferred) or dirb against ``base_url``.
-
-    ``base_url`` should include scheme and trailing slash is optional.
-    """
+    """Run content discovery against ``base_url`` using the best available Kali tool."""
     wl = Path(wordlist_path)
     if not wl.is_file():
-        return {
-            "base_url": base_url,
-            "status": "skipped",
-            "reason": f"wordlist not found: {wordlist_path}",
-            "tool": None,
-            "command": None,
-            "findings": [],
-            "stdout_tail": "",
-            "stderr_tail": "",
-        }
+        return {"base_url": base_url, "status": "skipped", "reason": f"wordlist not found: {wordlist_path}", "tool": None, "command": None, "findings": [], "stdout_tail": "", "stderr_tail": ""}
 
     name, exe = _pick_tool(tool)
     if not exe:
-        return {
-            "base_url": base_url,
-            "status": "skipped",
-            "reason": "Neither gobuster nor dirb found on PATH; install one or set directory_tool to none",
-            "tool": None,
-            "command": None,
-            "findings": [],
-            "stdout_tail": "",
-            "stderr_tail": "",
-        }
+        return {"base_url": base_url, "status": "skipped", "reason": "No supported directory brute-force tool found on PATH", "tool": None, "command": None, "findings": [], "stdout_tail": "", "stderr_tail": ""}
 
     url = base_url.rstrip("/") + "/"
+    t = str(max(1, min(int(threads), 50)))
+    ext = "txt,html,php,asp,aspx,jsp"
+    dot_ext = ",".join(["." + x for x in ext.split(",")])
 
-    if name == "gobuster":
-        cmd = [
-            exe,
-            "dir",
-            "-u",
-            url,
-            "-w",
-            str(wl),
-            "-t",
-            str(max(1, min(threads, 50))),
-            "-q",
-            "-k",
-            "--timeout",
-            "10s",
-        ]
+    if name == "feroxbuster":
+        cmd = [exe, "-u", url, "-w", str(wl), "-t", t, "-x", ext, "-k", "-q", "-e", "-r", "-n"]
+    elif name == "ffuf":
+        cmd = [exe, "-u", url + "FUZZ", "-w", str(wl), "-t", t, "-e", dot_ext, "-v", "-r", "-noninteractive"]
+    elif name == "gobuster":
+        cmd = [exe, "dir", "-u", url, "-w", str(wl), "-t", t, "-q", "-k", "--timeout", "10s", "-x", ext]
+    elif name == "dirsearch":
+        cmd = [exe, "-u", url, "-t", t, "-e", ext, "-f", "-q", "-F", "-w", str(wl), "--format=plain"]
     else:
-        cmd = [exe, url, str(wl), "-S", "-r"]
+        cmd = [exe, url, str(wl), "-S", "-r", "-X", "," + dot_ext]
 
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=max(30, timeout_sec),
-            errors="replace",
-        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max(30, timeout_sec), errors="replace")
     except subprocess.TimeoutExpired:
-        return {
-            "base_url": url,
-            "status": "timeout",
-            "tool": name,
-            "command": " ".join(cmd),
-            "findings": [],
-            "stdout_tail": "",
-            "stderr_tail": f"Exceeded {timeout_sec}s",
-        }
+        return {"base_url": url, "status": "timeout", "tool": name, "command": " ".join(cmd), "findings": [], "stdout_tail": "", "stderr_tail": f"Exceeded {timeout_sec}s"}
     except (FileNotFoundError, OSError) as exc:
-        return {
-            "base_url": url,
-            "status": "error",
-            "reason": str(exc),
-            "tool": name,
-            "command": " ".join(cmd),
-            "findings": [],
-            "stdout_tail": "",
-            "stderr_tail": "",
-        }
+        return {"base_url": url, "status": "error", "reason": str(exc), "tool": name, "command": " ".join(cmd), "findings": [], "stdout_tail": "", "stderr_tail": ""}
 
     out_lines = (proc.stdout or "").splitlines()
-    err = (proc.stderr or "").strip()
-    if name == "gobuster":
+    if name == "feroxbuster":
+        findings = _parse_ferox_lines(out_lines)
+    elif name == "ffuf":
+        findings = _parse_ffuf_lines(out_lines, url)
+    elif name == "gobuster":
         findings = _parse_gobuster_lines(out_lines)
+    elif name == "dirsearch":
+        findings = _parse_dirsearch_lines(out_lines)
     else:
         findings = _parse_dirb_lines(out_lines)
 
@@ -227,5 +221,5 @@ def run_directory_scan(
         "findings_interesting": interesting[:200],
         "findings_sample": findings[:80],
         "stdout_tail": (proc.stdout or "")[-12000:],
-        "stderr_tail": err[-4000:],
+        "stderr_tail": (proc.stderr or "")[-4000:],
     }
