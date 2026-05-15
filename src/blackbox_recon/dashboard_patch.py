@@ -1,18 +1,21 @@
-"""Runtime patch to print the operator dashboard after recon enrichment."""
+"""Runtime patch to print compact pentester triage after recon enrichment."""
 
 from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from .operator_dashboard import render_operator_dashboard
+from .triage_dashboard import render_triage_dashboard
 
 
 class DashboardAwareResults(dict):
-    """Suppress the old duplicate CLI tables while preserving saved JSON data."""
+    """Suppress old duplicate CLI tables while preserving saved JSON data."""
 
     def __init__(self, source: Dict[str, Any]):
         super().__init__(source)
         self["operator_dashboard_rendered"] = True
+        # Suppress the old legacy phase table and old truncated findings table
+        # printed by cli.py immediately after engine.run(). JSON/report data is
+        # still present for saved output and downstream processing.
         self._suppress_once = {"recon_phase_trace": 1, "deterministic_findings": 1}
 
     def get(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
@@ -23,7 +26,7 @@ class DashboardAwareResults(dict):
 
 
 def patch_operator_dashboard(ReconEngine: Any) -> None:
-    """Patch ReconEngine.run once so dashboard renders after the full result exists."""
+    """Patch ReconEngine.run once so compact triage renders after the full result exists."""
     if getattr(ReconEngine, "_blackbox_operator_dashboard_patched", False):
         return
 
@@ -32,12 +35,12 @@ def patch_operator_dashboard(ReconEngine: Any) -> None:
     async def run_with_operator_dashboard(self: Any, target: str, modules: List[str]) -> Dict[str, Any]:
         results = await original_run(self, target, modules)
         try:
-            render_operator_dashboard(results)
+            render_triage_dashboard(results)
             return DashboardAwareResults(results)
         except Exception as exc:  # dashboard must never fail the scan
             try:
                 from rich import print as rprint
-                rprint(f"[yellow][!][/yellow] Operator dashboard failed to render: {exc}")
+                rprint(f"[yellow][!][/yellow] Triage dashboard failed to render: {exc}")
             except Exception:
                 pass
         return results
