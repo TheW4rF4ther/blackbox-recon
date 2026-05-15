@@ -19,7 +19,7 @@ _THINK_SPAN_RE = re.compile(
 def strip_think_spans(text: str) -> str:
     return _THINK_SPAN_RE.sub("", (text or "")).strip()
 
-# Reject obvious planning / scaffolding before attempting JSON parse.
+
 _BAD_AI_PATTERN_STRS = [
     r"\bI need to\b",
     r"\bI should\b",
@@ -42,67 +42,28 @@ BAD_AI_PATTERNS = [re.compile(p, re.IGNORECASE) for p in _BAD_AI_PATTERN_STRS]
 
 
 JSON_ENRICHMENT_SYSTEM_PROMPT = (
-    "You are Blackbox Recon Analyst. You return only valid JSON (no markdown fences, no prose before or after). "
-    "You interpret an evidence_package produced by Blackbox Recon. "
-    "deterministic_findings in that package are authoritative: do not invent new findings, "
-    "do not change severity/status/evidence IDs, and do not invent CVEs, hosts, services, or paths. "
-    "No chain-of-thought, planning, drafts, or self-correction. "
-    "No exploit steps, payloads, credential attacks, persistence, evasion, or unauthorized access guidance."
+    "Return valid JSON only. You are Blackbox Recon Analyst. "
+    "Use only the provided compact evidence package. "
+    "deterministic_findings are authoritative: do not invent findings, CVEs, hosts, paths, services, or exploitability. "
+    "No chain-of-thought, drafts, markdown, prose, exploit steps, payloads, or credential attacks."
 )
 
 
 LOCAL_JSON_ENRICHMENT_PROMPT = """
-You will receive a JSON object: Blackbox Recon ``evidence_package`` with:
-- ``assessment`` (metadata, summary_metrics)
-- ``evidence`` (typed observations with IDs)
-- ``deterministic_findings`` (authoritative findings)
-- ``deterministic_attack_paths``
-- ``coverage_notes``
-
-Rules:
-1. Treat ``deterministic_findings`` as authoritative.
-2. Do not create new findings or alter severity, status, evidence_ids, or affected_assets on existing findings.
-3. Do not invent CVEs; only state confirmed CVEs if explicitly present in evidence text (usually none).
-4. Return **valid JSON only** matching the schema below (no markdown, no commentary).
-
-Schema (exact keys):
+Return JSON only with exact keys:
 {
-  "executive_summary": "Two polished client-ready sentences maximum.",
-  "risk_narrative": [
-    {
-      "finding_id": "DET-FIND-001",
-      "client_ready_text": "One concise paragraph referencing only cited evidence.",
-      "confidence_note": "Short note on evidence strength or uncertainty."
-    }
-  ],
-  "cve_assessment": {
-    "summary": "Whether any CVE is confirmed from evidence.",
-    "confirmed_cves": [],
-    "candidate_cves": [],
-    "reasoning_limits": ["Short factual limitation strings only."]
-  },
-  "recommended_next_steps": [
-    {
-      "tool": "sslscan",
-      "objective": "Assess TLS for observed HTTPS.",
-      "prerequisite": "HTTPS observed; ROE permits TLS review.",
-      "example_cli": "sslscan TARGET_IP",
-      "risk_notes": "Non-invasive; confirm scope."
-    }
-  ],
-  "quality_flags": [
-    { "type": "coverage_gap", "message": "Short factual note." }
-  ]
+  "executive_summary":"Two client-ready sentences maximum.",
+  "risk_narrative":[{"finding_id":"DET-FIND-001","client_ready_text":"One concise paragraph using only evidence.","confidence_note":"Short uncertainty note."}],
+  "cve_assessment":{"summary":"CVE status from evidence only.","confirmed_cves":[],"candidate_cves":[],"reasoning_limits":[]},
+  "recommended_next_steps":[{"tool":"name","objective":"why","prerequisite":"scope condition","example_cli":"command with TARGET_IP/HOST placeholders","risk_notes":"ROE note"}],
+  "quality_flags":[{"type":"coverage_gap","message":"Short factual note."}]
 }
-
-Use one ``risk_narrative`` entry per deterministic finding when possible (match ``finding_id``).
-Keep ``recommended_next_steps`` to at most 5 items. Use placeholders TARGET_IP, HOST, WORDLIST in example_cli.
+Use deterministic_findings as authoritative. Do not create new findings or change severity/status/evidence IDs. Max 5 next steps.
 """.strip()
 
 
 class RiskNarrativeItem(BaseModel):
     model_config = {"extra": "ignore"}
-
     finding_id: str = ""
     client_ready_text: str = ""
     confidence_note: str = ""
@@ -110,7 +71,6 @@ class RiskNarrativeItem(BaseModel):
 
 class CveAssessmentOut(BaseModel):
     model_config = {"extra": "ignore"}
-
     summary: str = ""
     confirmed_cves: List[str] = Field(default_factory=list)
     candidate_cves: List[str] = Field(default_factory=list)
@@ -119,7 +79,6 @@ class CveAssessmentOut(BaseModel):
 
 class NextStepItem(BaseModel):
     model_config = {"extra": "ignore"}
-
     tool: str = ""
     objective: str = ""
     prerequisite: str = ""
@@ -129,14 +88,12 @@ class NextStepItem(BaseModel):
 
 class QualityFlag(BaseModel):
     model_config = {"extra": "ignore"}
-
     type: str = ""
     message: str = ""
 
 
 class AiEnrichmentResponse(BaseModel):
     model_config = {"extra": "ignore"}
-
     executive_summary: str = ""
     risk_narrative: List[RiskNarrativeItem] = Field(default_factory=list)
     cve_assessment: CveAssessmentOut = Field(default_factory=CveAssessmentOut)
@@ -186,29 +143,102 @@ def parse_ai_enrichment_json(raw: str) -> Tuple[Optional[Dict[str, Any]], Option
     return model.model_dump(), None
 
 
-def evidence_package_dict_for_llm(recon_data: Dict[str, Any], *, max_evidence: int = 100) -> Dict[str, Any]:
+def _shorten(value: Any, max_len: int = 220) -> Any:
+    if isinstance(value, str):
+        v = " ".join(value.split())
+        return v[: max_len - 3] + "..." if len(v) > max_len else v
+    return value
+
+
+def evidence_package_dict_for_llm(recon_data: Dict[str, Any], *, max_evidence: int = 12) -> Dict[str, Any]:
+    """Return a compact package suitable for small local models.
+
+    Qwen 9B deployments in LM Studio often run with 4096-token context. Avoid
+    raw stdout, banners, TLS excerpts, and full evidence bodies; keep only the
+    authoritative findings, metrics, coverage notes, and a small evidence index.
+    """
     pkg = recon_data.get("evidence_package")
-    if not isinstance(pkg, dict) or not pkg.get("evidence"):
+    if not isinstance(pkg, dict) or not pkg.get("deterministic_findings"):
         from .evidence import build_evidence_package
 
         eng = recon_data.get("engagement") or {}
         mods = list(eng.get("modules_requested") or ["subdomain", "portscan", "technology"])
         lab_mode = not bool(eng.get("record"))
         pkg = build_evidence_package(recon_data, mods, lab_mode=lab_mode)
-    out = dict(pkg)
-    ev = list(out.get("evidence") or [])
-    if len(ev) > max_evidence:
-        out["evidence"] = ev[:max_evidence]
-        out["_evidence_omitted_count"] = len(ev) - max_evidence
-    return out
+
+    findings = []
+    for f in list(pkg.get("deterministic_findings") or [])[:12]:
+        if not isinstance(f, dict):
+            continue
+        findings.append(
+            {
+                "id": f.get("id"),
+                "code": f.get("finding_code"),
+                "severity": f.get("severity"),
+                "status": f.get("status"),
+                "title": _shorten(f.get("title"), 120),
+                "assets": list(f.get("affected_assets") or [])[:4],
+                "evidence_ids": list(f.get("evidence_ids") or [])[:6],
+                "impact": _shorten(f.get("impact"), 220),
+                "recommendation": _shorten(f.get("recommendation"), 220),
+            }
+        )
+
+    evidence_index = []
+    for e in list(pkg.get("evidence") or [])[:max_evidence]:
+        if not isinstance(e, dict):
+            continue
+        observed = e.get("observed_value") or {}
+        compact_observed = {}
+        if isinstance(observed, dict):
+            for k in (
+                "state",
+                "service",
+                "version",
+                "status_code",
+                "final_url",
+                "missing_security_headers",
+                "disclosure_headers",
+                "supported_protocols",
+                "weak_signals",
+                "target_type",
+                "interesting_paths_found",
+            ):
+                if k in observed and observed.get(k) not in (None, "", [], {}):
+                    compact_observed[k] = _shorten(observed.get(k), 180)
+        evidence_index.append(
+            {
+                "id": e.get("id"),
+                "phase": e.get("phase_id"),
+                "type": e.get("observation_type"),
+                "asset": _shorten(e.get("asset"), 160),
+                "confidence": e.get("confidence"),
+                "observed": compact_observed,
+            }
+        )
+
+    summary = ((pkg.get("assessment") or {}).get("summary_metrics") or {})
+    return {
+        "schema_version": pkg.get("schema_version", "1.0"),
+        "assessment": {
+            "target": ((pkg.get("assessment") or {}).get("target")),
+            "mode": ((pkg.get("assessment") or {}).get("mode")),
+            "summary_metrics": summary,
+        },
+        "deterministic_findings": findings,
+        "deterministic_attack_paths": list(pkg.get("deterministic_attack_paths") or [])[:3],
+        "coverage_notes": list(pkg.get("coverage_notes") or [])[:6],
+        "evidence_index": evidence_index,
+        "_compact_for_local_llm": True,
+    }
 
 
-def evidence_package_json_for_llm(recon_data: Dict[str, Any], max_chars: int = 16000) -> str:
+def evidence_package_json_for_llm(recon_data: Dict[str, Any], max_chars: int = 5200) -> str:
     pkg = evidence_package_dict_for_llm(recon_data)
     text = json.dumps(pkg, separators=(",", ":"), ensure_ascii=False)
     if len(text) <= max_chars:
         return text
-    for n in (60, 40, 25, 15, 10, 5, 0):
+    for n in (8, 5, 3, 0):
         pkg2 = evidence_package_dict_for_llm(recon_data, max_evidence=n)
         text = json.dumps(pkg2, separators=(",", ":"), ensure_ascii=False)
         if len(text) <= max_chars:
@@ -217,8 +247,7 @@ def evidence_package_json_for_llm(recon_data: Dict[str, Any], max_chars: int = 1
         {
             "schema_version": pkg.get("schema_version", "1.0"),
             "assessment": pkg.get("assessment") or {},
-            "deterministic_findings": (pkg.get("deterministic_findings") or [])[:20],
-            "deterministic_attack_paths": pkg.get("deterministic_attack_paths") or [],
+            "deterministic_findings": (pkg.get("deterministic_findings") or [])[:8],
             "coverage_notes": pkg.get("coverage_notes") or [],
             "_truncated": True,
         },
