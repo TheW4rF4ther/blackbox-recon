@@ -7,8 +7,10 @@ __license__ = "MIT"
 
 from .recon import ReconEngine
 from .posture_enrichment import patch_recon_engine
+from .dashboard_patch import patch_operator_dashboard
 
 patch_recon_engine(ReconEngine)
+patch_operator_dashboard(ReconEngine)
 
 from .ai_analyzer import AIAnalyzer
 from .config import Config
