@@ -48,6 +48,8 @@ def _status_style(status: str) -> str:
 
 def _signal_badge(signal: str) -> str:
     low = (signal or "").lower()
+    if "no weak signal" in low or "tls sampled" in low or "service script completed" in low:
+        return "[dim cyan][INFO][/dim cyan]"
     if "ssh exposed" in low or "web service exposed" in low or "interesting paths found" in low:
         return "[bold yellow][EXPOSURE][/bold yellow]"
     if "weak" in low or "missing security headers" in low or "service disclosure" in low:
@@ -65,7 +67,7 @@ def _is_low_signal(row: Dict[str, Any]) -> bool:
     output = " ".join(map(str, row.get("important_output") or [])).lower()
     if "error" in status or "fail" in status:
         return False
-    if any(x in signals or x in output for x in ("ssh exposed", "web service exposed", "weak", "missing security headers", "service disclosure", "interesting paths found", "waf_signal", "service script completed")):
+    if any(x in signals or x in output for x in ("ssh exposed", "web service exposed", "weak tls signal", "missing security headers", "service disclosure", "interesting paths found", "waf_signal", "service script completed")):
         return False
     return any(x in signals or x in output or x in status for x in ("no flagged", "0 interesting", "none observed", "not captured", "skipped", "no useful", "completed/no flagged"))
 
@@ -207,7 +209,6 @@ def _render_vulnerability_signals(findings: List[Dict[str, Any]]) -> None:
         return
     useful = [f for f in findings if str(f.get("finding_code") or "").startswith(("BBR-WEB-HDR", "BBR-TLS", "BBR-SSH", "BBR-SMB", "BBR-FTP", "BBR-SMTP", "BBR-RDP"))]
     if not useful:
-        # Avoid restating obvious exposure-only findings; those are already in Nmap/Open Ports.
         return
     table = Table(title="Vulnerability Identification Signals", box=box.ROUNDED, header_style="bold cyan")
     table.add_column("Code", style="bold yellow", no_wrap=True)
