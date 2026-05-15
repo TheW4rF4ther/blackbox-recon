@@ -36,6 +36,7 @@ from .ai_analyzer import (
 )
 from .kali_platform import ensure_kali_toolchain
 from .methodology import build_methodology_block
+from .report_renderer import render_technical_assessment_markdown
 
 
 for stream in (sys.stdout, sys.stderr):
@@ -519,7 +520,9 @@ def recon_main(
         table.add_row("Technology profiles stored", str(summary.get('technology_profiles_stored', summary.get('total_tech_detected', 0))))
         
         console.print(table)
-        
+
+        results["technical_report_markdown"] = render_technical_assessment_markdown(results)
+
         # Save results
         ws_reports = engagement_rt.paths["reports"] if engagement_rt else None
         output_path = resolve_report_path(output, target, output_format, workspace_reports=ws_reports)
@@ -667,9 +670,12 @@ def generate_markdown_report(results: dict, output_file: str):
         f.write(f"**Generated:** {results.get('timestamp', '')}  \n")
         f.write(f"**Completed (UTC):** {results.get('recon_completed_utc', '')}\n\n")
 
+        f.write(render_technical_assessment_markdown(results))
+        f.write("\n---\n\n## Appendices\n\n")
+
         plat = results.get("platform_toolchain") or {}
         if plat:
-            f.write("## Platform toolchain\n\n")
+            f.write("### Platform toolchain\n\n")
             f.write(f"- **Kali detected:** {plat.get('is_kali')} | **Debian-like:** {plat.get('is_debian_like')}\n")
             miss = plat.get("missing_apt_packages") or []
             if miss:
@@ -679,7 +685,7 @@ def generate_markdown_report(results: dict, output_file: str):
         meth = results.get("recon_methodology") or {}
         phases = meth.get("phases") or []
         if phases:
-            f.write("## Recon methodology (phase readiness)\n\n")
+            f.write("### Recon methodology (phase readiness)\n\n")
             for ph in phases:
                 ok = ph.get("ready")
                 f.write(
@@ -690,7 +696,7 @@ def generate_markdown_report(results: dict, output_file: str):
 
         trace = results.get("recon_phase_trace") or []
         if trace:
-            f.write("## PTES-style execution trace (what ran)\n\n")
+            f.write("### PTES-style execution trace (what ran)\n\n")
             f.write(
                 "Per-phase log of tooling: Python stack vs external binaries (`nmap`, `nslookup`, "
                 "`gobuster`/`dirb`). Each `command` value is the exact line executed where applicable.\n\n"
@@ -717,56 +723,24 @@ def generate_markdown_report(results: dict, output_file: str):
 
         snap = results.get("executive_snapshot") or {}
         if snap:
-            f.write("## Executive snapshot\n\n")
-            f.write(f"- **Open ports:** {snap.get('open_port_count', 0)}\n")
-            f.write(f"- **Web URLs scanned:** {snap.get('web_url_candidates', 0)}\n")
+            f.write("### Executive snapshot (supplementary metrics)\n\n")
+            f.write(f"- **Open ports (count):** {snap.get('open_port_count', 0)}\n")
+            f.write(f"- **HTTP URLs scanned (dir / content targets):** {snap.get('web_url_candidates', 0)}\n")
+            if snap.get("http_services_detected") is not None:
+                f.write(f"- **HTTP(S) services (from ports):** {snap.get('http_services_detected', 0)}\n")
+            if snap.get("subdomain_http_probes_with_status") is not None:
+                f.write(
+                    f"- **Subdomain HTTP probes w/ status:** "
+                    f"{snap.get('subdomain_http_probes_with_status', 0)}\n"
+                )
             if snap.get("dns_names_observed"):
                 f.write(f"- **DNS names observed:** {', '.join(snap['dns_names_observed'][:15])}\n")
-            f.write("\n")
-
-        f.write("## Summary\n\n")
-        summary = results.get("summary", {})
-        f.write(f"- **Subdomains found:** {summary.get('total_subdomains', 0)}\n")
-        f.write(
-            f"- **Open TCP ports:** {summary.get('open_tcp_ports', summary.get('total_open_ports', 0))}\n"
-        )
-        f.write(f"- **HTTP(S) services (from ports):** {summary.get('http_services_detected', 0)}\n")
-        f.write(
-            f"- **Subdomain HTTP probes with status:** "
-            f"{summary.get('subdomain_http_probes_with_status', summary.get('web_services', 0))}\n"
-        )
-        f.write(
-            f"- **HTTP URLs targeted:** "
-            f"{summary.get('http_urls_targeted', summary.get('web_urls_targeted', 0))}\n"
-        )
-        f.write(
-            f"- **Technology profiles stored:** "
-            f"{summary.get('technology_profiles_stored', summary.get('total_tech_detected', 0))}\n"
-        )
-        f.write(f"- **Nslookup runs:** {summary.get('nslookup_runs', 0)}\n")
-        f.write(f"- **Directory scan runs:** {summary.get('directory_scan_runs', 0)}\n")
-        f.write(f"- **Interesting directory hits:** {summary.get('directory_interesting_hits', 0)}\n\n")
-
-        det = results.get("deterministic_findings") or []
-        if det:
-            f.write("## Findings (evidence-backed)\n\n")
-            f.write("| ID | Code | Severity | Status | Title | Evidence IDs |\n")
-            f.write("|----|------|----------|--------|-------|---------------|\n")
-            for row in det[:25]:
-                eids = ", ".join(row.get("evidence_ids") or [])
-                if len(eids) > 80:
-                    eids = eids[:77] + "..."
-                title = str(row.get("title", "")).replace("|", "\\|")
-                f.write(
-                    f"| `{row.get('id', '')}` | `{row.get('finding_code') or ''}` | "
-                    f"{row.get('severity', '')} | {row.get('status', '')} | {title} | {eids} |\n"
-                )
             f.write("\n")
 
         dns = results.get("dns_intelligence") or {}
         lookups = dns.get("nslookups") or []
         if lookups:
-            f.write("## DNS intelligence (nslookup)\n\n")
+            f.write("### DNS intelligence (nslookup)\n\n")
             for row in lookups:
                 f.write(f"### {row.get('target')}\n\n")
                 f.write(f"- Status: `{row.get('status')}`  \n")
@@ -780,7 +754,7 @@ def generate_markdown_report(results: dict, output_file: str):
         nmap_meta = results.get("nmap_scan") or {}
         per_host = nmap_meta.get("per_host") or []
         if per_host:
-            f.write("## Nmap (per host)\n\n")
+            f.write("### Nmap (per host)\n\n")
             for h in per_host:
                 f.write(f"- **{h.get('host')}:** `{h.get('command')}`  \n")
                 f.write(
@@ -790,7 +764,11 @@ def generate_markdown_report(results: dict, output_file: str):
             f.write("\n")
 
         if results.get("ai_analysis"):
-            f.write("## AI Analysis\n\n")
+            f.write("### Narrative enrichment (model-generated)\n\n")
+            f.write(
+                "*The following prose is optional model output for triage context only. "
+                "It does not supersede the evidence-backed technical assessment above.*\n\n"
+            )
             f.write(results["ai_analysis"].get("technical_analysis", ""))
             f.write("\n\n")
             steps = results["ai_analysis"].get("recommended_next_steps") or []
@@ -816,7 +794,7 @@ def generate_markdown_report(results: dict, output_file: str):
                 f.write("\n")
 
         if results.get("subdomains"):
-            f.write("## Subdomains\n\n")
+            f.write("### Subdomains\n\n")
             f.write("| Subdomain | IP Addresses | Status |\n")
             f.write("|-----------|--------------|--------|\n")
             for sub in results["subdomains"]:
@@ -826,7 +804,7 @@ def generate_markdown_report(results: dict, output_file: str):
             f.write("\n")
 
         if results.get("ports"):
-            f.write("## Open ports / services\n\n")
+            f.write("### Open ports / services\n\n")
             f.write("| Host | Port | Service | Version / details |\n")
             f.write("|------|------|---------|---------------------|\n")
             for port in results["ports"]:
@@ -841,7 +819,7 @@ def generate_markdown_report(results: dict, output_file: str):
         web = results.get("web_content_discovery") or {}
         scans = web.get("directory_scans") or []
         if scans:
-            f.write("## Web content discovery\n\n")
+            f.write("### Web content discovery\n\n")
             for s in scans:
                 f.write(f"### {s.get('base_url')}\n\n")
                 f.write(f"- Tool: {s.get('tool')} | Status: {s.get('status')}\n")
