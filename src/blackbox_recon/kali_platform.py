@@ -23,6 +23,7 @@ TOOLS_NMAP = ExternalTool("nmap", ("nmap",), ("nmap",))
 TOOLS_NSLOOKUP = ExternalTool("nslookup", ("nslookup",), ("dnsutils",))
 TOOLS_GOBUSTER = ExternalTool("gobuster", ("gobuster",), ("gobuster",))
 TOOLS_DIRB = ExternalTool("dirb", ("dirb",), ("dirb",))
+TOOLS_SSLSCAN = ExternalTool("sslscan", ("sslscan",), ("sslscan",))
 
 
 def read_os_release() -> Dict[str, str]:
@@ -69,9 +70,7 @@ def _directory_scan_needs(cfg: Dict[str, Any]) -> Tuple[bool, str]:
 
 
 def missing_packages_for_config(cfg: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-    """
-    Return (missing_tool_ids, apt_package_names) for the current recon config.
-    """
+    """Return (missing_tool_ids, apt_package_names) for the current recon config."""
     missing_ids: List[str] = []
     pkgs: Set[str] = set()
 
@@ -104,6 +103,14 @@ def missing_packages_for_config(cfg: Dict[str, Any]) -> Tuple[List[str], List[st
             missing_ids.append(TOOLS_DIRB.tool_id)
             pkgs.update(TOOLS_DIRB.debian_packages)
 
+    if bool(cfg.get("tls_scan_enabled", True)):
+        st = tool_status(TOOLS_SSLSCAN)
+        if not st["present"]:
+            # TLS module can still collect certificate metadata with Python ssl,
+            # but sslscan provides the Kali-native protocol/cipher inventory.
+            missing_ids.append(TOOLS_SSLSCAN.tool_id)
+            pkgs.update(TOOLS_SSLSCAN.debian_packages)
+
     return missing_ids, sorted(pkgs)
 
 
@@ -119,6 +126,7 @@ def build_toolchain_snapshot(cfg: Dict[str, Any]) -> Dict[str, Any]:
             "nslookup": tool_status(TOOLS_NSLOOKUP),
             "gobuster": tool_status(TOOLS_GOBUSTER),
             "dirb": tool_status(TOOLS_DIRB),
+            "sslscan": tool_status(TOOLS_SSLSCAN),
         },
         "missing_tool_ids": miss_ids,
         "missing_apt_packages": miss_pkgs,
@@ -131,21 +139,14 @@ def sudo_noninteractive_ok() -> bool:
     try:
         if hasattr(os, "geteuid") and os.geteuid() == 0:
             return True
-        proc = subprocess.run(
-            ["sudo", "-n", "true"],
-            capture_output=True,
-            text=True,
-            timeout=8,
-        )
+        proc = subprocess.run(["sudo", "-n", "true"], capture_output=True, text=True, timeout=8)
         return proc.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False
 
 
 def run_apt_install(packages: Sequence[str], *, update_first: bool = False) -> Tuple[bool, str]:
-    """
-    Install Debian packages using non-interactive sudo. Returns (ok, combined_output).
-    """
+    """Install Debian packages using non-interactive sudo. Returns (ok, combined_output)."""
     pkgs = [p for p in packages if p]
     if not pkgs:
         return True, ""
@@ -157,37 +158,18 @@ def run_apt_install(packages: Sequence[str], *, update_first: bool = False) -> T
 
     parts: List[str] = []
     if update_first:
-        u = subprocess.run(
-            prefix + ["apt-get", "update", "-qq"],
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
+        u = subprocess.run(prefix + ["apt-get", "update", "-qq"], capture_output=True, text=True, timeout=600)
         parts.append((u.stdout or "") + (u.stderr or ""))
         if u.returncode != 0:
             return False, "\n".join(parts)
 
-    proc = subprocess.run(
-        prefix + ["apt-get", "install", "-y", "-qq", *pkgs],
-        capture_output=True,
-        text=True,
-        timeout=3600,
-    )
+    proc = subprocess.run(prefix + ["apt-get", "install", "-y", "-qq", *pkgs], capture_output=True, text=True, timeout=3600)
     parts.append((proc.stdout or "") + (proc.stderr or ""))
     return proc.returncode == 0, "\n".join(parts).strip()
 
 
-def ensure_kali_toolchain(
-    cfg: Dict[str, Any],
-    *,
-    auto_install: bool,
-    apt_update_first: bool = False,
-) -> Tuple[Dict[str, Any], Optional[str]]:
-    """
-    Build a toolchain snapshot; optionally install missing apt packages on Kali/Debian-like hosts.
-
-    Returns (snapshot, error_message_or_none).
-    """
+def ensure_kali_toolchain(cfg: Dict[str, Any], *, auto_install: bool, apt_update_first: bool = False) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Build a toolchain snapshot; optionally install missing apt packages on Kali/Debian-like hosts."""
     snap = build_toolchain_snapshot(cfg)
     miss = snap.get("missing_apt_packages") or []
     if not miss or not auto_install:
@@ -197,11 +179,7 @@ def ensure_kali_toolchain(
         return snap, "auto_install requested but host is not Kali/Debian-like; skipping apt."
 
     if not sudo_noninteractive_ok():
-        return (
-            snap,
-            "Cannot install packages: need passwordless sudo (sudo -n) or run as root. "
-            f"Install manually: sudo apt-get install -y {' '.join(miss)}",
-        )
+        return snap, "Cannot install packages: need passwordless sudo (sudo -n) or run as root. Install manually: sudo apt-get install -y " + " ".join(miss)
 
     ok, out = run_apt_install(miss, update_first=apt_update_first)
     if not ok:

@@ -58,8 +58,6 @@ def _version_is_precise(version: Any) -> bool:
     v = str(version).strip().lower()
     if not v or v in ("unknown", "none", "null", "n/a"):
         return False
-    # Product-only banners such as "nginx" are useful inventory but not precise
-    # enough for patch or CVE confidence.
     return bool(re.search(r"\d", v))
 
 
@@ -121,7 +119,6 @@ def build_evidence_records(results: Dict[str, Any]) -> List[EvidenceRecord]:
             )
         )
 
-    # M1 — subdomains (only rows with DNS or HTTP signal to avoid empty-label noise)
     for i, s in enumerate(results.get("subdomains") or []):
         if not isinstance(s, dict):
             continue
@@ -144,7 +141,6 @@ def build_evidence_records(results: Dict[str, Any]) -> List[EvidenceRecord]:
             )
         )
 
-    # M2 — nslookup
     for i, row in enumerate((results.get("dns_intelligence") or {}).get("nslookups") or []):
         if not isinstance(row, dict):
             continue
@@ -158,16 +154,12 @@ def build_evidence_records(results: Dict[str, Any]) -> List[EvidenceRecord]:
                 target=target,
                 asset=tgt,
                 observation_type="dns_record",
-                observed_value={
-                    "status": row.get("status"),
-                    "parsed": row.get("parsed") or {},
-                },
+                observed_value={"status": row.get("status"), "parsed": row.get("parsed") or {}},
                 confidence="high" if row.get("status") == "ok" else "medium",
                 raw_ref=f"dns_intelligence.nslookups[{i}]",
             )
         )
 
-    # M3 — ports
     for i, p in enumerate(results.get("ports") or []):
         if not isinstance(p, dict):
             continue
@@ -197,7 +189,6 @@ def build_evidence_records(results: Dict[str, Any]) -> List[EvidenceRecord]:
             )
         )
 
-    # M4 — directory scans
     scans = (results.get("web_content_discovery") or {}).get("directory_scans") or []
     for i, run in enumerate(scans):
         if not isinstance(run, dict):
@@ -232,16 +223,12 @@ def build_evidence_records(results: Dict[str, Any]) -> List[EvidenceRecord]:
                     target=target,
                     asset=base or target,
                     observation_type="negative_result",
-                    observed_value={
-                        "interesting_paths_found": 0,
-                        "status": run.get("status"),
-                    },
+                    observed_value={"interesting_paths_found": 0, "status": run.get("status")},
                     confidence="medium",
                     raw_ref=f"web_content_discovery.directory_scans[{i}]",
                 )
             )
 
-    # M5 — technologies
     for i, tech in enumerate(results.get("technologies") or []):
         if not isinstance(tech, dict):
             continue
@@ -261,6 +248,61 @@ def build_evidence_records(results: Dict[str, Any]) -> List[EvidenceRecord]:
             )
         )
 
+    # M6 — HTTP security headers / basic web response posture.
+    for i, row in enumerate((results.get("http_header_analysis") or {}).get("results") or []):
+        if not isinstance(row, dict):
+            continue
+        out.append(
+            EvidenceRecord(
+                id=_next_id("M6"),
+                phase_id="M6",
+                source_tool="requests_headers",
+                command=f"GET {row.get('url')} timeout=10 verify=False allow_redirects=True",
+                target=target,
+                asset=str(row.get("url") or row.get("final_url") or target),
+                observation_type="http_response" if not row.get("error") else "tool_error",
+                observed_value={
+                    "status_code": row.get("status_code"),
+                    "final_url": row.get("final_url"),
+                    "title": row.get("title"),
+                    "observed_security_headers": row.get("observed_security_headers") or {},
+                    "missing_security_headers": row.get("missing_security_headers") or [],
+                    "disclosure_headers": row.get("disclosure_headers") or {},
+                    "cookie_flags": row.get("cookie_flags") or [],
+                    "http_to_https_redirect": row.get("http_to_https_redirect"),
+                    "error": row.get("error"),
+                },
+                confidence="medium" if row.get("error") else "high",
+                raw_ref=f"http_header_analysis.results[{i}]",
+            )
+        )
+
+    # M7 — TLS posture summary.
+    for i, row in enumerate((results.get("tls_analysis") or {}).get("results") or []):
+        if not isinstance(row, dict):
+            continue
+        asset = f"{row.get('host')}:{row.get('port')}/tcp"
+        out.append(
+            EvidenceRecord(
+                id=_next_id("M7"),
+                phase_id="M7",
+                source_tool=str(row.get("tool") or "tls_scan"),
+                command=row.get("command"),
+                target=target,
+                asset=asset,
+                observation_type="tls_observation" if row.get("status") == "ok" else "tool_error",
+                observed_value={
+                    "status": row.get("status"),
+                    "certificate": row.get("certificate") or {},
+                    "supported_protocols": row.get("supported_protocols") or [],
+                    "weak_signals": row.get("weak_signals") or [],
+                    "error": row.get("error"),
+                },
+                confidence="medium",
+                raw_ref=f"tls_analysis.results[{i}]",
+            )
+        )
+
     return out
 
 
@@ -276,7 +318,6 @@ def build_deterministic_findings(evidence: List[EvidenceRecord], results: Dict[s
         n += 1
         return cur
 
-    # Exposed SSH (aggregate all SSH listeners)
     ssh_rows: List[EvidenceRecord] = []
     for e in evidence:
         if e.phase_id != "M3" or e.observation_type not in ("open_port", "service_banner"):
@@ -287,23 +328,8 @@ def build_deterministic_findings(evidence: List[EvidenceRecord], results: Dict[s
         if port == 22 or svc == "ssh":
             ssh_rows.append(e)
     if ssh_rows:
-        findings.append(
-            Finding(
-                id=_fid(),
-                finding_code="BBR-EXPOSURE-001",
-                title="Internet-exposed SSH service",
-                severity="medium",
-                status="confirmed",
-                affected_assets=[e.asset for e in ssh_rows],
-                evidence_ids=[e.id for e in ssh_rows],
-                impact="Remote administration surface reachable from the scanned perspective.",
-                recommendation="Restrict by firewall/VPN, enforce key-based auth, disable weak ciphers, keep OpenSSH patched.",
-                validation="Re-scan from an authorized vantage; verify sshd_config and listening interfaces.",
-                confidence="high",
-            )
-        )
+        findings.append(Finding(id=_fid(), finding_code="BBR-EXPOSURE-001", title="Internet-exposed SSH service", severity="medium", status="confirmed", affected_assets=[e.asset for e in ssh_rows], evidence_ids=[e.id for e in ssh_rows], impact="Remote administration surface reachable from the scanned perspective.", recommendation="Restrict by firewall/VPN, enforce key-based auth, disable weak ciphers, keep OpenSSH patched.", validation="Re-scan from an authorized vantage; verify sshd_config and listening interfaces.", confidence="high"))
 
-    # Exposed HTTP(S)
     web_evidence: List[EvidenceRecord] = []
     for e in evidence:
         if e.phase_id != "M3" or e.observation_type not in ("open_port", "service_banner"):
@@ -314,103 +340,44 @@ def build_deterministic_findings(evidence: List[EvidenceRecord], results: Dict[s
         if _http_like_port_row({"port": port, "service": svc}):
             web_evidence.append(e)
     if web_evidence:
-        assets = [e.asset for e in web_evidence]
-        findings.append(
-            Finding(
-                id=_fid(),
-                finding_code="BBR-EXPOSURE-002",
-                title="Internet-exposed HTTP/HTTPS service",
-                severity="medium",
-                status="confirmed",
-                affected_assets=assets,
-                evidence_ids=[e.id for e in web_evidence],
-                impact="Public web surface increases exposure to misconfiguration and application-layer risk.",
-                recommendation="Verify patch level, TLS configuration, security headers, and attack surface of deployed apps.",
-                validation="Review nginx/http configs and dependency versions from an authenticated assessment if in scope.",
-                confidence="medium",
-            )
-        )
+        findings.append(Finding(id=_fid(), finding_code="BBR-EXPOSURE-002", title="Internet-exposed HTTP/HTTPS service", severity="medium", status="confirmed", affected_assets=[e.asset for e in web_evidence], evidence_ids=[e.id for e in web_evidence], impact="Public web surface increases exposure to misconfiguration and application-layer risk.", recommendation="Verify patch level, TLS configuration, security headers, and attack surface of deployed apps.", validation="Review nginx/http configs and dependency versions from an authenticated assessment if in scope.", confidence="medium"))
 
-    # Version fingerprint incomplete (HTTP-like services with product-only or missing version detail)
     for e in web_evidence:
         ver = (e.observed_value or {}).get("version")
         svc = str((e.observed_value or {}).get("service") or "").lower()
         m = re.search(r":(\d+)/tcp", e.asset)
         port = int(m.group(1)) if m else 0
         if _http_like_port_row({"port": port, "service": svc}) and not _version_is_precise(ver):
-            findings.append(
-                Finding(
-                    id=_fid(),
-                    finding_code="BBR-FP-001",
-                    title="Service fingerprint incomplete for web stack",
-                    severity="informational",
-                    status="confirmed",
-                    affected_assets=[e.asset],
-                    evidence_ids=[e.id],
-                    impact="CVE correlation and patch urgency are harder to establish without a precise product version.",
-                    recommendation="Run an in-scope version probe (e.g. authenticated config review or allowed banner enrichment).",
-                    validation="Confirm whether a precise version string becomes available with additional safe probes.",
-                    confidence="high",
-                )
-            )
+            findings.append(Finding(id=_fid(), finding_code="BBR-FP-001", title="Service fingerprint incomplete for web stack", severity="informational", status="confirmed", affected_assets=[e.asset], evidence_ids=[e.id], impact="CVE correlation and patch urgency are harder to establish without a precise product version.", recommendation="Run an in-scope version probe (e.g. authenticated config review or allowed banner enrichment).", validation="Confirm whether a precise version string becomes available with additional safe probes.", confidence="high"))
             break
 
-    # Directory bruteforce interesting hits
     dir_hits = [e for e in evidence if e.observation_type == "directory_hit"]
     if dir_hits:
-        findings.append(
-            Finding(
-                id=_fid(),
-                finding_code="BBR-WEB-001",
-                title="Web content discovery identified sensitive or notable paths",
-                severity="medium",
-                status="confirmed",
-                affected_assets=[e.asset for e in dir_hits[:25]],
-                evidence_ids=[e.id for e in dir_hits[:25]],
-                impact="Exposed paths may indicate backup files, admin interfaces, or unintended content.",
-                recommendation="Validate ownership and sensitivity of each path; remove or restrict as appropriate.",
-                validation="Manually review each hit under ROE before interaction.",
-                confidence="high",
-            )
-        )
+        findings.append(Finding(id=_fid(), finding_code="BBR-WEB-001", title="Web content discovery identified sensitive or notable paths", severity="medium", status="confirmed", affected_assets=[e.asset for e in dir_hits[:25]], evidence_ids=[e.id for e in dir_hits[:25]], impact="Exposed paths may indicate backup files, admin interfaces, or unintended content.", recommendation="Validate ownership and sensitivity of each path; remove or restrict as appropriate.", validation="Manually review each hit under ROE before interaction.", confidence="high"))
 
-    # Negative directory result (aggregate one informational)
     neg_dirs = [e for e in evidence if e.observation_type == "negative_result" and e.phase_id == "M4"]
     if neg_dirs and not dir_hits:
-        findings.append(
-            Finding(
-                id=_fid(),
-                finding_code="BBR-WEB-NEG-001",
-                title="Directory discovery found no flagged interesting paths",
-                severity="informational",
-                status="not_observed",
-                affected_assets=list({e.asset for e in neg_dirs}),
-                evidence_ids=[e.id for e in neg_dirs],
-                impact="Reduces evidence of common sensitive paths; does not prove absence of sensitive endpoints.",
-                recommendation="Continue assessment with authenticated crawling or manual review if authorized.",
-                validation="Compare against application map and unauthenticated crawl limits.",
-                confidence="medium",
-            )
-        )
+        findings.append(Finding(id=_fid(), finding_code="BBR-WEB-NEG-001", title="Directory discovery found no flagged interesting paths", severity="informational", status="not_observed", affected_assets=list({e.asset for e in neg_dirs}), evidence_ids=[e.id for e in neg_dirs], impact="Reduces evidence of common sensitive paths; does not prove absence of sensitive endpoints.", recommendation="Continue assessment with authenticated crawling or manual review if authorized.", validation="Compare against application map and unauthenticated crawl limits.", confidence="medium"))
 
-    # Bare IP — DNS coverage
+    header_rows = [e for e in evidence if e.phase_id == "M6" and e.observation_type == "http_response"]
+    header_missing = [e for e in header_rows if (e.observed_value or {}).get("missing_security_headers")]
+    if header_missing:
+        findings.append(Finding(id=_fid(), finding_code="BBR-WEB-HDR-001", title="HTTP security headers incomplete or missing", severity="low", status="confirmed", affected_assets=[e.asset for e in header_missing[:10]], evidence_ids=[e.id for e in header_missing[:10]], impact="Missing browser-enforced security headers can weaken defense-in-depth against clickjacking, content injection, MIME sniffing, and downgrade scenarios.", recommendation="Review and deploy appropriate HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, and Permissions-Policy controls for each application.", validation="Re-run HTTP header analysis and verify expected headers are present on all in-scope web entry points.", confidence="high"))
+
+    disclosure_rows = [e for e in header_rows if (e.observed_value or {}).get("disclosure_headers")]
+    if disclosure_rows:
+        findings.append(Finding(id=_fid(), finding_code="BBR-WEB-HDR-002", title="HTTP service disclosure headers observed", severity="informational", status="confirmed", affected_assets=[e.asset for e in disclosure_rows[:10]], evidence_ids=[e.id for e in disclosure_rows[:10]], impact="Server or framework headers may assist fingerprinting and version-targeting when combined with other observations.", recommendation="Remove or normalize unnecessary product/version disclosure headers where operationally feasible.", validation="Confirm response headers no longer disclose unnecessary server or framework details.", confidence="high"))
+
+    tls_rows = [e for e in evidence if e.phase_id == "M7" and e.observation_type == "tls_observation"]
+    weak_tls = [e for e in tls_rows if (e.observed_value or {}).get("weak_signals")]
+    if weak_tls:
+        findings.append(Finding(id=_fid(), finding_code="BBR-TLS-001", title="TLS configuration weak-signal observed", severity="medium", status="confirmed", affected_assets=[e.asset for e in weak_tls], evidence_ids=[e.id for e in weak_tls], impact="Deprecated protocols, weak ciphers, or certificate issues can reduce transport security and increase downgrade or interception risk.", recommendation="Disable legacy protocols/ciphers and replace invalid or expired certificates according to current TLS hardening guidance.", validation="Re-run sslscan/testssl-style validation and confirm weak signals are absent.", confidence="medium"))
+    elif tls_rows:
+        findings.append(Finding(id=_fid(), finding_code="BBR-TLS-INFO-001", title="TLS service observed and profiled", severity="informational", status="confirmed", affected_assets=[e.asset for e in tls_rows], evidence_ids=[e.id for e in tls_rows], impact="TLS was present and basic posture metadata was recorded for reporting and follow-up.", recommendation="Review full TLS output in the evidence package and validate against organizational cipher/protocol standards.", validation="Confirm certificate metadata and protocol support are acceptable for the environment.", confidence="medium"))
+
     if _target_is_bare_ip(target):
         ctx_ids = [e.id for e in evidence if e.observation_type == "coverage_context" and e.phase_id == "CTX"]
-        findings.append(
-            Finding(
-                id=_fid(),
-                finding_code="BBR-COVERAGE-001",
-                title="Bare IP target limits hostname-oriented discovery",
-                severity="informational",
-                status="confirmed",
-                affected_assets=[target],
-                evidence_ids=ctx_ids,
-                impact="Subdomain-style labels against an IP are usually low-yield versus an apex domain.",
-                recommendation="When possible, scope an apex hostname for DNS and web asset mapping.",
-                validation="Re-run subdomain module against the domain apex if in scope.",
-                confidence="high",
-            )
-        )
+        findings.append(Finding(id=_fid(), finding_code="BBR-COVERAGE-001", title="Bare IP target limits hostname-oriented discovery", severity="informational", status="confirmed", affected_assets=[target], evidence_ids=ctx_ids, impact="Subdomain-style labels against an IP are usually low-yield versus an apex domain.", recommendation="When possible, scope an apex hostname for DNS and web asset mapping.", validation="Re-run subdomain module against the domain apex if in scope.", confidence="high"))
 
     return findings
 
@@ -421,27 +388,9 @@ def build_deterministic_attack_paths(findings: List[Finding]) -> List[Dict[str, 
     ssh = next((f for f in findings if f.finding_code == "BBR-EXPOSURE-001"), None)
     web = next((f for f in findings if f.finding_code == "BBR-EXPOSURE-002"), None)
     if ssh:
-        paths.append(
-            {
-                "entry_point": ssh.affected_assets[0] if ssh.affected_assets else "SSH",
-                "risk_chain": "Network-reachable SSH may be targeted for authentication attacks if weak controls exist.",
-                "potential_impact": "Host compromise and lateral movement if credentials or configuration are weak.",
-                "confidence": "medium",
-                "defensive_priority": "P1",
-                "evidence_ids": ssh.evidence_ids,
-            }
-        )
+        paths.append({"entry_point": ssh.affected_assets[0] if ssh.affected_assets else "SSH", "risk_chain": "Network-reachable SSH may be targeted for authentication attacks if weak controls exist.", "potential_impact": "Host compromise and lateral movement if credentials or configuration are weak.", "confidence": "medium", "defensive_priority": "P1", "evidence_ids": ssh.evidence_ids})
     if web:
-        paths.append(
-            {
-                "entry_point": ", ".join(web.affected_assets[:6]) if web.affected_assets else "HTTP(S)",
-                "risk_chain": "Public web services may expose misconfigurations or vulnerable application components.",
-                "potential_impact": "Data exposure, defacement, or downstream compromise depending on application risk.",
-                "confidence": "medium",
-                "defensive_priority": "P2",
-                "evidence_ids": web.evidence_ids,
-            }
-        )
+        paths.append({"entry_point": ", ".join(web.affected_assets[:6]) if web.affected_assets else "HTTP(S)", "risk_chain": "Public web services may expose misconfigurations or vulnerable application components.", "potential_impact": "Data exposure, defacement, or downstream compromise depending on application risk.", "confidence": "medium", "defensive_priority": "P2", "evidence_ids": web.evidence_ids})
     return paths
 
 
@@ -463,12 +412,14 @@ def build_coverage_notes(results: Dict[str, Any], evidence: List[EvidenceRecord]
         if _http_like_port_row({"port": port, "service": svc}) and not _version_is_precise(v):
             notes.append("At least one HTTP-like service was detected without a precise version string in scan output.")
             break
+    if any(e.phase_id == "M6" for e in evidence):
+        notes.append("HTTP security header posture was sampled from discovered HTTP(S) URLs.")
+    if any(e.phase_id == "M7" for e in evidence):
+        notes.append("TLS posture was sampled from discovered HTTPS URLs; full cipher validation depends on sslscan availability.")
     return notes
 
 
-def build_evidence_package(
-    results: Dict[str, Any], modules: List[str], *, lab_mode: bool = False
-) -> Dict[str, Any]:
+def build_evidence_package(results: Dict[str, Any], modules: List[str], *, lab_mode: bool = False) -> Dict[str, Any]:
     """Single machine-readable bundle for automation, AI input, and audit."""
     evidence = build_evidence_records(results)
     findings = build_deterministic_findings(evidence, results)
@@ -476,13 +427,11 @@ def build_evidence_package(
     target = str(results.get("target") or "")
     summary = results.get("summary") or {}
     return {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "assessment": {
             "target": target,
             "mode": "lab" if lab_mode else "engaged",
-            "authorization_context": (
-                "Lab mode; engagement gates disabled" if lab_mode else "Engagement-gated execution"
-            ),
+            "authorization_context": "Lab mode; engagement gates disabled" if lab_mode else "Engagement-gated execution",
             "modules_executed": modules,
             "recon_started_utc": results.get("recon_started_utc"),
             "recon_completed_utc": results.get("recon_completed_utc"),
@@ -492,6 +441,8 @@ def build_evidence_package(
                 "http_urls_targeted": summary.get("http_urls_targeted", summary.get("web_urls_targeted", 0)),
                 "subdomain_http_probes_with_status": summary.get("subdomain_http_probes_with_status", 0),
                 "technology_profiles_stored": summary.get("technology_profiles_stored", 0),
+                "http_header_urls_analyzed": summary.get("http_header_urls_analyzed", 0),
+                "tls_services_analyzed": summary.get("tls_services_analyzed", 0),
             },
         },
         "evidence": [e.model_dump() for e in evidence],
