@@ -28,6 +28,21 @@ def _phase_command(results: Dict[str, Any], phase_id: str, label_contains: Optio
     return None
 
 
+def _phase_commands(results: Dict[str, Any], phase_id: str, label_contains: Optional[str] = None) -> List[str]:
+    out: List[str] = []
+    for phase in results.get("recon_phase_trace") or []:
+        if phase.get("phase_id") != phase_id:
+            continue
+        for cmd in phase.get("commands_executed") or []:
+            label = str(cmd.get("label") or "")
+            command = cmd.get("command")
+            if not command:
+                continue
+            if label_contains is None or label_contains.lower() in label.lower():
+                out.append(str(command))
+    return out
+
+
 def _ports(results: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [p for p in (results.get("ports") or []) if isinstance(p, dict)]
 
@@ -77,9 +92,9 @@ def _nmap_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not ports:
         return None
     lines = []
-    for p in ports[:20]:
+    for p in ports[:30]:
         ver = p.get("version") or p.get("banner") or ""
-        lines.append(f"{p.get('host')}:{p.get('port')}/tcp {p.get('service') or 'unknown'} {p.get('state') or 'open'} {_short(ver, 120)}".strip())
+        lines.append(f"{p.get('host')}:{p.get('port')}/tcp {p.get('service') or 'unknown'} {p.get('state') or 'open'} {_short(ver, 140)}".strip())
     signals = []
     if any(int(p.get("port") or 0) == 22 for p in ports):
         signals.append("SSH exposed")
@@ -97,123 +112,206 @@ def _dns_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         records = row.get("records") or []
         if records:
             lines.append(f"{row.get('record_type')} {row.get('target')}: {', '.join(map(str, records[:8]))}")
-        else:
-            lines.append(f"{row.get('record_type')} {row.get('target')}: no records ({row.get('status')})")
+    if not lines:
+        return None
     return _result("dig", "DNS record enrichment", "completed", _phase_command(results, "M10"), lines, [], [])
 
 
-def _gobuster_results(results: Dict[str, Any]) -> List[Dict[str, Any]]:
-    out = []
-    for scan in _dir_scans(results):
+def _gobuster_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    scans = _dir_scans(results)
+    if not scans:
+        return None
+    lines: List[str] = []
+    assets: List[str] = []
+    total_hits = 0
+    statuses: List[str] = []
+    for scan in scans:
+        base = str(scan.get("base_url") or "")
+        assets.append(base)
         hits = scan.get("findings_interesting") or []
-        lines = []
+        total_hits += len(hits)
+        statuses.append(f"{base}: {scan.get('status') or 'completed'}")
         if hits:
-            for h in hits[:15]:
+            lines.append(f"{base}: {len(hits)} interesting path(s)")
+            for h in hits[:10]:
                 if isinstance(h, dict):
-                    lines.append(f"{h.get('path')} status={h.get('status_code')} size={h.get('size', '-')}")
+                    lines.append(f"  {h.get('path')} status={h.get('status_code')} size={h.get('size', '-')}")
         else:
-            lines.append("0 interesting paths found")
+            lines.append(f"{base}: 0 interesting paths found")
         if scan.get("error"):
-            lines.append(f"error: {_short(scan.get('error'), 180)}")
-        out.append(_result(str(scan.get("tool") or "gobuster"), f"Web content discovery for {scan.get('base_url')}", str(scan.get("status") or "completed"), scan.get("command") or _phase_command(results, "M4"), lines, ["interesting paths found" if hits else "no flagged paths"], [str(scan.get("base_url"))]))
-    return out
+            lines.append(f"{base}: error={_short(scan.get('error'), 180)}")
+    cmds = _phase_commands(results, "M4")
+    command = " | ".join(cmds[:3]) if cmds else None
+    if len(cmds) > 3:
+        command += f" | +{len(cmds)-3} more"
+    return _result("gobuster/dirb", "Web content discovery across discovered HTTP(S) services", "completed", command, lines, ["interesting paths found" if total_hits else "no flagged paths", *statuses[:3]], sorted(set(assets)))
 
 
-def _http_header_results(results: Dict[str, Any]) -> List[Dict[str, Any]]:
-    out = []
-    for row in _http_rows(results):
-        lines = [
-            f"status={row.get('status_code') or 'n/a'} final_url={row.get('final_url') or row.get('url')}",
-            f"title={row.get('title') or 'n/a'}",
-        ]
+def _http_header_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # Keep this only if it provides something a tester could actually use.
+    rows = _http_rows(results)
+    lines: List[str] = []
+    signals: List[str] = []
+    assets: List[str] = []
+    for row in rows:
         missing = row.get("missing_security_headers") or []
-        if missing:
-            lines.append("missing_security_headers=" + ", ".join(map(str, missing)))
         disclosure = row.get("disclosure_headers") or {}
-        if disclosure:
-            lines.append("disclosure_headers=" + ", ".join(f"{k}={v}" for k, v in list(disclosure.items())[:6]))
-        if row.get("error"):
-            lines.append(f"error={_short(row.get('error'), 180)}")
-        signals = []
+        status = row.get("status_code")
+        title = row.get("title")
+        if not (missing or disclosure or status or title or row.get("error")):
+            continue
+        assets.append(str(row.get("url") or row.get("final_url") or ""))
+        pieces = [str(row.get("url") or "")]
+        if status:
+            pieces.append(f"status={status}")
+        if title:
+            pieces.append(f"title={_short(title, 80)}")
         if missing:
+            pieces.append("missing=" + ", ".join(map(str, missing[:8])))
             signals.append("missing security headers")
         if disclosure:
+            pieces.append("disclosure=" + ", ".join(f"{k}={v}" for k, v in list(disclosure.items())[:4]))
             signals.append("service disclosure headers")
-        out.append(_result("requests", f"HTTP response and header review for {row.get('url')}", "completed" if not row.get("error") else "tool_error", row.get("command") or f"GET {row.get('url')}", lines, signals, [str(row.get("url"))]))
-    return out
+        if row.get("error"):
+            pieces.append(f"error={_short(row.get('error'), 120)}")
+        lines.append(" | ".join(pieces))
+    if not lines or not signals:
+        return None
+    return _result("requests", "HTTP response/header signals", "completed", _phase_command(results, "M6"), lines, sorted(set(signals)), sorted(set(a for a in assets if a)))
 
 
-def _tls_results(results: Dict[str, Any]) -> List[Dict[str, Any]]:
-    out = []
-    for row in _tls_rows(results):
+def _tls_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    rows = _tls_rows(results)
+    if not rows:
+        return None
+    lines: List[str] = []
+    signals: List[str] = []
+    assets: List[str] = []
+    for row in rows:
+        asset = f"{row.get('host')}:{row.get('port')}"
+        assets.append(asset)
         cert = row.get("certificate") or {}
-        lines = [
-            "supported_protocols=" + (", ".join(map(str, row.get("supported_protocols") or [])) or "not parsed"),
-            "weak_signals=" + (", ".join(map(str, row.get("weak_signals") or [])) or "none observed"),
-        ]
-        if cert:
-            for key in ("subject", "issuer", "not_after"):
-                if cert.get(key):
-                    lines.append(f"cert_{key}={_short(cert.get(key), 160)}")
-        signals = ["weak TLS signal" for _ in row.get("weak_signals") or []]
-        out.append(_result(str(row.get("tool") or "sslscan"), f"TLS posture sampling for {row.get('host')}:{row.get('port')}", str(row.get("status") or "completed"), row.get("command"), lines, signals or ["TLS sampled"], [f"{row.get('host')}:{row.get('port')}"]))
+        protos = ", ".join(map(str, row.get("supported_protocols") or [])) or "not parsed"
+        weak = ", ".join(map(str, row.get("weak_signals") or [])) or "none observed"
+        lines.append(f"{asset}: protocols={protos}; weak_signals={weak}")
+        for key in ("subject", "issuer", "not_after"):
+            if cert.get(key):
+                lines.append(f"{asset}: cert_{key}={_short(cert.get(key), 170)}")
+        if row.get("weak_signals"):
+            signals.append("weak TLS signal")
+        else:
+            signals.append("TLS sampled; no weak signal recorded")
+    if not lines:
+        return None
+    cmd = _phase_command(results, "M7")
+    return _result("sslscan", "TLS protocol/certificate review", "completed", cmd, lines, sorted(set(signals)), sorted(set(assets)))
+
+
+def _meaningful_script_lines(text: str) -> List[str]:
+    out: List[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("Starting Nmap") or line.startswith("Nmap scan report") or line.startswith("Host is up") or line.startswith("Nmap done"):
+            continue
+        if line in ("PORT   STATE SERVICE", "PORT     STATE SERVICE"):
+            continue
+        out.append(line)
+        if len(out) >= 12:
+            break
     return out
 
 
-def _service_enum_results(results: Dict[str, Any]) -> List[Dict[str, Any]]:
-    out = []
-    for row in _service_rows(results):
+def _service_enum_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    rows = _service_rows(results)
+    if not rows:
+        return None
+    lines: List[str] = []
+    signals: List[str] = []
+    assets: List[str] = []
+    cmds: List[str] = []
+    for row in rows:
+        asset = f"{row.get('host')}:{row.get('port')}"
+        assets.append(asset)
+        if row.get("command"):
+            cmds.append(str(row.get("command")))
         findings = [f for f in (row.get("findings") or []) if isinstance(f, dict)]
-        lines = []
         if findings:
             for f in findings[:8]:
-                lines.append(f"{f.get('type')}: {_short(f.get('values') or f.get('observed') or f.get('banner') or f, 160)}")
+                typ = str(f.get("type"))
+                lines.append(f"{asset} {row.get('module')}: {typ} {_short(f.get('values') or f.get('observed') or f.get('banner') or f, 160)}")
+                signals.append(typ)
         else:
-            lines.append("completed/no flagged service-specific signal")
-        if row.get("error"):
-            lines.append(f"error={_short(row.get('error'), 180)}")
-        out.append(_result(str(row.get("tool") or row.get("module") or "service_enum"), f"Service-specific enumeration for {row.get('host')}:{row.get('port')} ({row.get('service')})", str(row.get("status") or "completed"), row.get("command"), lines, [str(f.get("type")) for f in findings], [f"{row.get('host')}:{row.get('port')}"]))
-    return out
+            script_lines = _meaningful_script_lines(str(row.get("stdout_excerpt") or ""))
+            if script_lines:
+                lines.append(f"{asset} {row.get('module')}: script completed; no blacklist weak-signal matched")
+                for s in script_lines[:8]:
+                    lines.append(f"  {s}")
+                signals.append("service script completed")
+            elif row.get("error"):
+                lines.append(f"{asset} {row.get('module')}: error={_short(row.get('error'), 140)}")
+                signals.append("service enum error")
+    if not lines:
+        return None
+    cmd = " | ".join(cmds[:3]) if cmds else None
+    return _result("nmap/service helpers", "Service-specific enumeration details", "completed", cmd, lines, sorted(set(signals)), sorted(set(assets)))
 
 
-def _webfp_results(results: Dict[str, Any]) -> List[Dict[str, Any]]:
-    out = []
-    for row in _webfp_rows(results):
+def _webfp_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    rows = _webfp_rows(results)
+    lines: List[str] = []
+    signals: List[str] = []
+    assets: List[str] = []
+    cmds: List[str] = []
+    for row in rows:
         findings = [f for f in (row.get("findings") or []) if isinstance(f, dict)]
-        lines = []
-        if findings:
-            for f in findings[:4]:
-                lines.append(f"{f.get('type')}: {_short(f.get('summary') or f, 220)}")
-        else:
-            lines.append(_short(row.get("stdout_excerpt") or row.get("error") or "completed/no useful fingerprint signal", 220))
-        out.append(_result(str(row.get("tool") or "web_fingerprint"), f"Web fingerprinting for {row.get('url')}", str(row.get("status") or "completed"), row.get("command"), lines, [str(f.get("type")) for f in findings], [str(row.get("url"))]))
-    return out
+        keep_findings = [f for f in findings if f.get("type") in ("whatweb_fingerprint", "waf_signal")]
+        if not keep_findings:
+            continue
+        if row.get("command"):
+            cmds.append(str(row.get("command")))
+        assets.append(str(row.get("url") or ""))
+        for f in keep_findings[:4]:
+            lines.append(f"{row.get('url')} {row.get('tool')}: {f.get('type')} {_short(f.get('summary') or f, 220)}")
+            signals.append(str(f.get("type")))
+    if not lines:
+        return None
+    command = " | ".join(cmds[:3]) if cmds else None
+    return _result("whatweb/wafw00f", "Web stack and WAF fingerprint signals", "completed", command, lines, sorted(set(signals)), sorted(set(a for a in assets if a)))
 
 
-def _screenshot_results(results: Dict[str, Any]) -> List[Dict[str, Any]]:
-    out = []
-    for row in _screenshot_rows(results):
+def _screenshot_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    rows = _screenshot_rows(results)
+    lines: List[str] = []
+    assets: List[str] = []
+    cmds: List[str] = []
+    for row in rows:
         path = row.get("screenshot_path")
-        lines = [f"screenshot={path}" if path else f"not captured: {row.get('error') or row.get('status')}"]
-        out.append(_result(str(row.get("tool") or "gowitness"), f"Screenshot triage for {row.get('url')}", str(row.get("status") or "skipped"), row.get("command"), lines, ["screenshot captured" if path else "screenshot not captured"], [str(row.get("url"))]))
-    return out
+        if not path:
+            continue
+        assets.append(str(row.get("url") or ""))
+        if row.get("command"):
+            cmds.append(str(row.get("command")))
+        lines.append(f"{row.get('url')}: screenshot={path}")
+    if not lines:
+        return None
+    return _result("gowitness", "Screenshot triage", "completed", " | ".join(cmds[:3]) if cmds else None, lines, ["screenshot captured"], sorted(set(assets)))
 
 
 def build_tool_results(results: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Build ordered, concise tool results for terminal and report output."""
     out: List[Dict[str, Any]] = []
-    nmap = _nmap_result(results)
-    if nmap:
-        out.append(nmap)
-    dns = _dns_result(results)
-    if dns:
-        out.append(dns)
-    out.extend(_gobuster_results(results))
-    out.extend(_http_header_results(results))
-    out.extend(_tls_results(results))
-    out.extend(_service_enum_results(results))
-    out.extend(_webfp_results(results))
-    out.extend(_screenshot_results(results))
+    for item in (
+        _nmap_result(results),
+        _dns_result(results),
+        _gobuster_result(results),
+        _http_header_result(results),
+        _tls_result(results),
+        _service_enum_result(results),
+        _webfp_result(results),
+        _screenshot_result(results),
+    ):
+        if item and item.get("important_output"):
+            out.append(item)
     for idx, row in enumerate(out, start=1):
         row["id"] = f"TOOL-{idx:03d}"
     return out
