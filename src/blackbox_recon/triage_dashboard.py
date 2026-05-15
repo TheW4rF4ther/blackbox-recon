@@ -1,7 +1,7 @@
 """Pentester-forward terminal output for Blackbox Recon.
 
 Primary contract: tool used -> command -> pertinent output -> signals.
-After the tools, show vulnerability-identification signals and likely next moves.
+After the tools, show technical verification targets only when they add value.
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ def _is_low_signal(row: Dict[str, Any]) -> bool:
     output = " ".join(map(str, row.get("important_output") or [])).lower()
     if "error" in status or "fail" in status:
         return False
-    if any(x in signals or x in output for x in ("ssh exposed", "web service exposed", "weak", "missing security headers", "service disclosure", "interesting paths found", "waf_signal")):
+    if any(x in signals or x in output for x in ("ssh exposed", "web service exposed", "weak", "missing security headers", "service disclosure", "interesting paths found", "waf_signal", "service script completed")):
         return False
     return any(x in signals or x in output or x in status for x in ("no flagged", "0 interesting", "none observed", "not captured", "skipped", "no useful", "completed/no flagged"))
 
@@ -86,17 +86,17 @@ def _finding_by_code(results: Dict[str, Any], code: str) -> List[Dict[str, Any]]
     return [f for f in _findings(results) if f.get("finding_code") == code]
 
 
-def _likely_next_moves(results: Dict[str, Any]) -> List[Tuple[str, str, str]]:
-    moves: List[Tuple[str, str, str]] = []
+def _verification_targets(results: Dict[str, Any]) -> List[Tuple[str, str, str, str]]:
+    targets: List[Tuple[str, str, str, str]] = []
     if _has_port(results, 22):
-        moves.append(("1", "SSH", "Validate authentication policy, exposed users/process, and ssh2-enum-algos output."))
+        targets.append(("SSH", "22/tcp", "Auth methods, password policy, key-only enforcement, algorithm list", "ssh -o PreferredAuthentications=none -v USER@TARGET; review ssh2-enum-algos output"))
     if _has_port(results, 80) or _has_port(results, 443):
-        moves.append(("2", "Web", "Rerun with hostname/apex domain for vhost/SNI-aware content discovery, headers, WAF, TLS, and screenshots."))
+        targets.append(("HTTP/S", "80/443", "Hostname/vhost routing, app identity, default nginx, hidden content", "Re-run against scoped FQDN; add Host header/vhost discovery before vuln testing"))
     if results.get("tls_analysis"):
-        moves.append(("3", "TLS", "Review sslscan protocol/certificate output; map weak signals to client hardening standards."))
+        targets.append(("TLS", "443/tcp", "Certificate CN/SAN/issuer/expiry, TLS versions, weak ciphers/protocols", "Use sslscan/testssl.sh against FQDN + IP; compare to client crypto standard"))
     if _finding_by_code(results, "BBR-COVERAGE-001"):
-        moves.append(("4", "Scope", "Bare IP limits app recon. Obtain scoped DNS names before deeper web exploitation planning."))
-    return moves[:6]
+        targets.append(("Scope", "bare IP", "SNI/vhost/subdomain blindness", "Obtain apex domain or scoped hostname; repeat recon with DNS context"))
+    return targets[:6]
 
 
 def render_triage_dashboard(results: Dict[str, Any]) -> None:
@@ -121,7 +121,7 @@ def render_triage_dashboard(results: Dict[str, Any]) -> None:
     _render_open_ports(results)
     _render_tool_results(tool_results)
     _render_vulnerability_signals(findings)
-    _render_next_moves(results)
+    _render_verification_targets(results)
     _render_tester_takeaway(results)
 
 
@@ -205,13 +205,17 @@ def _render_tool_results(tool_results: List[Dict[str, Any]]) -> None:
 def _render_vulnerability_signals(findings: List[Dict[str, Any]]) -> None:
     if not findings:
         return
+    useful = [f for f in findings if str(f.get("finding_code") or "").startswith(("BBR-WEB-HDR", "BBR-TLS", "BBR-SSH", "BBR-SMB", "BBR-FTP", "BBR-SMTP", "BBR-RDP"))]
+    if not useful:
+        # Avoid restating obvious exposure-only findings; those are already in Nmap/Open Ports.
+        return
     table = Table(title="Vulnerability Identification Signals", box=box.ROUNDED, header_style="bold cyan")
     table.add_column("Code", style="bold yellow", no_wrap=True)
     table.add_column("Sev", no_wrap=True)
     table.add_column("Status", no_wrap=True)
     table.add_column("Assets", style="bright_white", overflow="fold")
     table.add_column("Signal", style="bright_white", overflow="fold")
-    ordered = sorted(findings, key=lambda f: {"critical": 0, "high": 1, "medium": 2, "low": 3, "informational": 4}.get(str(f.get("severity")).lower(), 9))
+    ordered = sorted(useful, key=lambda f: {"critical": 0, "high": 1, "medium": 2, "low": 3, "informational": 4}.get(str(f.get("severity")).lower(), 9))
     for f in ordered[:10]:
         sev = str(f.get("severity") or "")
         assets = ", ".join(map(str, (f.get("affected_assets") or [])[:3])) or "-"
@@ -219,30 +223,31 @@ def _render_vulnerability_signals(findings: List[Dict[str, Any]]) -> None:
     console.print(table)
 
 
-def _render_next_moves(results: Dict[str, Any]) -> None:
-    moves = _likely_next_moves(results)
-    if not moves:
+def _render_verification_targets(results: Dict[str, Any]) -> None:
+    targets = _verification_targets(results)
+    if not targets:
         return
-    table = Table(title="Likely Way Forward", box=box.ROUNDED, header_style="bold red")
-    table.add_column("#", justify="right", style="bold yellow", no_wrap=True)
+    table = Table(title="Technical Verification Targets", box=box.ROUNDED, header_style="bold red")
     table.add_column("Area", style="bold white", no_wrap=True)
-    table.add_column("Pentester action", style="cyan", overflow="fold")
-    for row in moves:
+    table.add_column("Asset", style="bold yellow", no_wrap=True)
+    table.add_column("Verify", style="bright_white", overflow="fold")
+    table.add_column("Command / method", style="cyan", overflow="fold")
+    for row in targets:
         table.add_row(*row)
     console.print(table)
 
 
 def _render_tester_takeaway(results: Dict[str, Any]) -> None:
     bullets: List[str] = []
-    if _has_port(results, 80) or _has_port(results, 443):
-        bullets.append("Primary manual path: web testing needs hostname/vhost context for meaningful app discovery.")
-    if _has_port(results, 22):
-        bullets.append("Exposed SSH should be validated for auth policy, hardening, and accepted algorithms.")
     summary = results.get("summary") or {}
+    if _has_port(results, 80) or _has_port(results, 443):
+        bullets.append("Best next technical move: rerun web recon against the scoped hostname, not just the IP.")
+    if _has_port(results, 22):
+        bullets.append("SSH is worth hardening verification, but not a finding by itself without auth/crypto weakness evidence.")
     if int(summary.get("interesting_paths_found", 0) or 0) == 0:
-        bullets.append("Current content discovery found 0 flagged interesting paths.")
+        bullets.append("Directory brute force produced no useful paths on this target/profile.")
     if _finding_by_code(results, "BBR-COVERAGE-001"):
-        bullets.append("Bare-IP scope limits subdomain, Host-header, and TLS/SNI reconnaissance quality.")
+        bullets.append("Current scan is reconnaissance-limited by bare-IP scope; DNS/vhost context is required for serious web testing.")
     if not bullets:
         return
     text = Text()
