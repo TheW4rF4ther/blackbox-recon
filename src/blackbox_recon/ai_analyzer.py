@@ -4,7 +4,7 @@ import json
 import re
 from abc import ABC, abstractmethod
 from typing import Dict, List, Any, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import requests
 from requests import HTTPError
@@ -266,14 +266,32 @@ def _strip_local_visible_thinking_preamble(text: str) -> str:
     return t_norm
 
 
+def _unwrap_star_draft_lines(text: str) -> str:
+    """Turn ``* Draft: <actual prose>`` into just the prose (models often label the real answer as Draft)."""
+    pat = re.compile(r"(?mi)^(\s*)\*+\s*Draft:\s*(.+)$")
+    out_lines: List[str] = []
+    for line in text.splitlines():
+        m = pat.match(line)
+        if m:
+            body = m.group(2).strip()
+            if len(body) >= 12:
+                out_lines.append(body)
+                continue
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+
 def _drop_star_prefixed_rubric_lines(text: str) -> str:
     """Remove Qwen-style rubric echoes that start with a star bullet (not part of the deliverable)."""
+    # Note: do not use ``\b`` immediately after ``:`` — word boundaries do not occur between ``:`` and space,
+    # so lines like ``*   Constraint: Max 2 sentences`` would incorrectly survive.
     kill = re.compile(
         r"(?mi)^\s*\*+\s*("
         r"Must be\b|"
-        r"Format:\b|"
-        r"Constraint:\b|"
-        r"Draft:\b|"
+        r"Format:|"
+        r"Constraint:|"
+        r"Content:|"
+        r"Draft:\s*$|"
         r"Refining\b|"
         r"Bullet\s+\d+:|"
         r"Each bullet\b|"
@@ -281,7 +299,15 @@ def _drop_star_prefixed_rubric_lines(text: str) -> str:
         r"Rules for\b|"
         r"Exactly\s+\d+\s+bullets?\b|"
         r"Up to\s+\d+\s+bullets?\b|"
-        r"Provide up to\b"
+        r"Provide up to\b|"
+        r"I need to\b|"
+        r"I must\b|"
+        r"I should\b|"
+        r"I will\b|"
+        r"The JSON doesn'?t\b|"
+        r"Since the prompt\b|"
+        r"Based on the data\b|"
+        r"There aren'?t many\b"
         r").*$"
     )
     out: List[str] = []
@@ -292,13 +318,88 @@ def _drop_star_prefixed_rubric_lines(text: str) -> str:
     return "\n".join(out)
 
 
+def _collapse_blank_lines(text: str, max_blank_run: int = 2) -> str:
+    """Collapse runs of empty lines so panels do not look sparse after stripping."""
+    lines = text.splitlines()
+    out: List[str] = []
+    blank_run = 0
+    for line in lines:
+        if not line.strip():
+            blank_run += 1
+            if blank_run <= max_blank_run:
+                out.append("")
+        else:
+            blank_run = 0
+            out.append(line)
+    return "\n".join(out).strip()
+
+
 def _finalize_local_assistant_markdown(text: str) -> str:
     """Normalize local LLM text for display (strip template think spans + visible planning)."""
     t = _strip_rich_panel_borders(text)
     t = _THINK_SPAN_RE.sub("", t).strip()
+    t = _normalize_local_section_headers(t)
+    t = _unwrap_star_draft_lines(t)
+    t = _drop_star_prefixed_rubric_lines(t)
     t = _strip_local_visible_thinking_preamble(t)
     t = _drop_star_prefixed_rubric_lines(t)
+    t = _collapse_blank_lines(t)
     return t
+
+
+NEXT_STEPS_MARKER = "NEXT_STEPS_JSON:"
+
+
+def split_next_steps_marker(text: str) -> Tuple[str, Optional[str]]:
+    """
+    Split narrative analysis from optional ``NEXT_STEPS_JSON:{...}`` suffix.
+
+    If the model wraps JSON across lines, extract from first ``{`` to last ``}``.
+    """
+    if NEXT_STEPS_MARKER not in text:
+        return text, None
+    pre, post = text.rsplit(NEXT_STEPS_MARKER, 1)
+    post = post.strip()
+    if not post:
+        return pre.rstrip(), None
+    blob = post
+    if "```" in post:
+        post = re.sub(r"^```(?:json)?\s*", "", post, flags=re.IGNORECASE).strip()
+        post = re.sub(r"\s*```\s*$", "", post).strip()
+        blob = post
+    if "{" in blob and "}" in blob:
+        i = blob.find("{")
+        j = blob.rfind("}")
+        if i != -1 and j > i:
+            blob = blob[i : j + 1]
+    return pre.rstrip(), blob
+
+
+def parse_recommended_next_steps(blob: Optional[str]) -> List[Dict[str, Any]]:
+    """Parse ``recommended_next_steps`` from JSON (advisory only)."""
+    if not blob:
+        return []
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        return []
+    arr = data.get("recommended_next_steps") if isinstance(data, dict) else None
+    if not isinstance(arr, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in arr[:8]:
+        if not isinstance(item, dict):
+            continue
+        row = {
+            "tool": str(item.get("tool", "")).strip()[:120],
+            "objective": str(item.get("objective", "")).strip()[:500],
+            "prerequisite": str(item.get("prerequisite", "")).strip()[:500],
+            "example_cli": str(item.get("example_cli", "")).strip()[:800],
+            "risk_notes": str(item.get("risk_notes", "")).strip()[:500],
+        }
+        if row["tool"]:
+            out.append(row)
+    return out
 
 
 def check_local_llm_connection(base_url: str, timeout: float = 10.0) -> Tuple[str, Optional[str]]:
@@ -491,6 +592,7 @@ STRICT OUTPUT RULES:
 1) Executive summary
 - Do not write anything before that line.
 - Do not include chain-of-thought, thinking process, drafts, assumptions, or numbered plans.
+- Do not emit star-prefixed meta lines (for example lines starting with "* Constraint:", "* Content:", "* Draft:") that restate the instructions; write the finished report only.
 - Do not recommend additional scanning unless required to validate a specific uncertain finding.
 - Do not provide exploit steps, payloads, shell commands, brute-force instructions, or weaponized guidance.
 - Be concise and specific.
@@ -530,6 +632,14 @@ Provide up to 3 bullets.
 Mention uncertainty caused by missing version data, unauthenticated scan limits, filtered ports, or incomplete tool output.
 - Do not echo instruction rubric (no "Must be 2 sentences", "Format:", "Constraint:", or "Refining" meta-lines).
 - Do not describe your drafting process; output only the finished numbered sections.
+7) Recommended follow-up tooling (advisory only — not executed by Blackbox Recon)
+After section 6, add ONE line by itself (no markdown fences) in exactly this pattern:
+NEXT_STEPS_JSON:{"recommended_next_steps":[{"tool":"ffuf","objective":"short text","prerequisite":"open port / scope note","example_cli":"ffuf -u http://HOST/FUZZ -w WORDLIST -mc 200,301 -json","risk_notes":"ROE / rate-limit reminder"}]}
+Rules for that JSON line:
+- Single line after the colon; valid JSON object; max 5 objects in recommended_next_steps.
+- Use placeholders HOST, TARGET_IP, WORDLIST in example_cli (no real secrets).
+- Suggest only tools appropriate for authorized testing (e.g. ffuf, sslscan, enum4linux-ng, nmap scripts).
+- Do not suggest password spraying, credential stuffing, exploit chains, or destructive actions unless the engagement explicitly allows them (assume they do not).
 """.strip()
 
 
@@ -549,12 +659,14 @@ def check_ollama_connection(base_url: str, timeout: float = 10.0) -> str:
 @dataclass
 class AnalysisResult:
     """Result from AI analysis."""
+
     attack_paths: List[Dict[str, Any]]
     prioritized_findings: List[Dict[str, Any]]
     correlations: List[Dict[str, Any]]
     executive_summary: str
     technical_analysis: str
     confidence_score: float
+    recommended_next_steps: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class AIProvider(ABC):
@@ -633,11 +745,12 @@ class ClaudeProvider(AIProvider):
 
 class LocalProvider(AIProvider):
     """Local LLM provider (LM Studio, etc.) via OpenAI-compatible API."""
-    
+
     def __init__(self, url: str = "http://localhost:1234/v1", model: Optional[str] = None):
-        self.url = url.rstrip('/')
+        self.url = url.rstrip("/")
         self.model = model
         self.headers = {"Content-Type": "application/json"}
+        self.last_recommended_next_steps: List[Dict[str, Any]] = []
     
     def analyze(self, recon_data: Dict[str, Any], prompt_template: str) -> str:
         """Analyze with local LLM."""
@@ -647,6 +760,7 @@ class LocalProvider(AIProvider):
                 "Pass --ai-model with the exact id from LM Studio, or ensure /v1/models returns a model."
             )
         try:
+            self.last_recommended_next_steps = []
             payload_json = shrink_recon_payload_for_llm(
                 recon_data,
                 max_chars=3400,
@@ -698,7 +812,11 @@ class LocalProvider(AIProvider):
                     "chat variant, increase Context Length / max tokens, or pick another model. "
                     f"Response (truncated): {json.dumps(body, ensure_ascii=False)[:1800]}"
                 )
-            return _finalize_local_assistant_markdown(text)
+            self.last_recommended_next_steps = []
+            body, blob = split_next_steps_marker(text)
+            if blob:
+                self.last_recommended_next_steps = parse_recommended_next_steps(blob)
+            return _finalize_local_assistant_markdown(body)
         except HTTPError as exc:
             body = ""
             if exc.response is not None:
@@ -778,6 +896,10 @@ Analyze it and provide:
 
 5. CORRELATIONS: Identify relationships between findings (e.g., "Jenkins on dev + weak SMB = internal access")
 
+6. ADVISORY NEXT STEPS (optional tooling — not run by this app): After your narrative, add exactly one line:
+NEXT_STEPS_JSON:{"recommended_next_steps":[{"tool":"name","objective":"why","prerequisite":"scope/port","example_cli":"command with HOST TARGET_IP WORDLIST placeholders","risk_notes":"ROE note"}]}
+Max 5 entries; valid single-line JSON; no credential attacks unless explicitly allowed by engagement.
+
 Be specific, actionable, and focus on what a penetration tester should prioritize for remediation. Avoid generic advice."""
 
     def __init__(self, provider: str, api_key: Optional[str] = None, 
@@ -815,17 +937,25 @@ Be specific, actionable, and focus on what a penetration tester should prioritiz
         print(f"[AI] Analyzing attack surface with {self.provider_name}...")
         prompt = self.ANALYSIS_PROMPT if self.provider_name != "local" else LOCAL_ANALYSIS_PROMPT
         raw_analysis = self.provider.analyze(recon_data, prompt)
-        
-        # Parse the response into structured format
-        # For now, return as-is wrapped in the result structure
-        # In production, you'd parse the markdown/JSON response
+
+        steps: List[Dict[str, Any]] = []
+        narrative = raw_analysis
+        if self.provider_name == "local" and isinstance(self.provider, LocalProvider):
+            steps = list(self.provider.last_recommended_next_steps)
+        elif NEXT_STEPS_MARKER in (raw_analysis or ""):
+            narrative, blob = split_next_steps_marker(raw_analysis)
+            steps = parse_recommended_next_steps(blob)
+
+        exec_src = narrative or ""
+        executive = exec_src[:500] if len(exec_src) > 500 else exec_src
         return AnalysisResult(
             attack_paths=[],
             prioritized_findings=[],
             correlations=[],
-            executive_summary=raw_analysis[:500] if len(raw_analysis) > 500 else raw_analysis,
-            technical_analysis=raw_analysis,
-            confidence_score=0.85
+            executive_summary=executive,
+            technical_analysis=narrative,
+            confidence_score=0.85,
+            recommended_next_steps=steps,
         )
     
     def generate_attack_path(self, entry_point: str, target_type: str) -> Dict[str, Any]:

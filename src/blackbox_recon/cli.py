@@ -318,8 +318,14 @@ def recon_main(
                 sys.exit(1)
         else:
             console.print(
-                "[yellow][!] Lab mode: engagement gates off (--lab / BLACKBOX_RECON_LAB=1). "
-                "No authorization, scope, or workspace enforcement.[/yellow]"
+                Panel(
+                    "[bold]Lab mode[/bold] — engagement gates are off ([cyan]--lab[/cyan] or "
+                    "[cyan]BLACKBOX_RECON_LAB=1[/cyan]). "
+                    "No authorization, scope, or workspace enforcement.",
+                    title="[yellow]Notice[/yellow]",
+                    border_style="yellow",
+                    padding=(0, 1),
+                )
             )
 
         engine = ReconEngine(recon_config, engagement_rt)
@@ -329,20 +335,20 @@ def recon_main(
 
         trace = results.get("recon_phase_trace") or []
         if trace:
-            console.print("\n[bold cyan]Penetration-test recon — what actually ran[/bold cyan]")
-            et = Table(title="PTES phases (live execution)", box=box.ROUNDED)
-            et.add_column("Phase", style="cyan", no_wrap=True)
-            et.add_column("Status", style="magenta")
-            et.add_column("Commands", justify="right")
-            et.add_column("Sample tooling / command line", style="dim")
+            console.print("\n[bold cyan]Recon phases (this run)[/bold cyan]")
+            et = Table(title="Commands executed per PTES phase", box=box.SIMPLE_HEAD)
+            et.add_column("Phase", style="cyan", no_wrap=True, width=5)
+            et.add_column("Status", style="magenta", width=11)
+            et.add_column("#", justify="right", width=3)
+            et.add_column("Representative command", style="dim", max_width=76, overflow="ellipsis")
             for row in trace:
                 cmds = row.get("commands_executed") or []
                 samp = ""
                 if cmds:
                     first = cmds[0]
-                    samp = f"{first.get('label', '')}: {(first.get('command') or '')[:90]}"
+                    samp = f"{first.get('label', '')}: {first.get('command') or ''}"
                     if len(cmds) > 1:
-                        samp += " …"
+                        samp += " (+{} more)".format(len(cmds) - 1)
                 et.add_row(
                     str(row.get("phase_id", "")),
                     str(row.get("status", "")),
@@ -351,8 +357,7 @@ def recon_main(
                 )
             console.print(et)
             console.print(
-                "[dim]Full subprocess lines, timestamps, and PTES copy live under JSON key "
-                "`recon_phase_trace` (per-phase `commands_executed`).[/dim]"
+                "[dim]Timestamps and full command lines: JSON key `recon_phase_trace`.[/dim]"
             )
         
         # AI Analysis
@@ -384,12 +389,9 @@ def recon_main(
                         model=ai_model
                     )
                 
-                console.print("[bold green][*] AI analyzing attack surface...[/bold green]")
+                console.print("\n[bold green]AI analysis[/bold green] [dim]· generating report…[/dim]")
                 analysis = analyzer.analyze_recon_data(results)
-                
-                # Display AI analysis
-                console.print("\n[bold yellow]AI Analysis Results[/bold yellow]")
-                console.print("=" * 60)
+
                 analysis_body = (analysis.technical_analysis or "").strip()
                 if not analysis_body:
                     analysis_body = (
@@ -397,14 +399,45 @@ def recon_main(
                         "In LM Studio: raise max tokens, disable extended reasoning for this model, "
                         "or use a non-thinking chat model. Raw JSON is still in the saved report.[/dim]"
                     )
-                console.print(Panel(analysis_body, title="Analysis", border_style="green"))
+                console.print(
+                    Panel(
+                        analysis_body,
+                        title="[bold]Attack surface analysis[/bold]",
+                        subtitle="[dim]Advisory triage from this run · not exploitation guidance[/dim]",
+                        title_align="left",
+                        border_style="green",
+                        padding=(1, 2),
+                    )
+                )
                 
                 # Add analysis to results
                 results['ai_analysis'] = {
                     'executive_summary': analysis.executive_summary,
                     'technical_analysis': analysis.technical_analysis,
-                    'confidence_score': analysis.confidence_score
+                    'confidence_score': analysis.confidence_score,
+                    'recommended_next_steps': analysis.recommended_next_steps,
                 }
+
+                if analysis.recommended_next_steps:
+                    console.print(
+                        "\n[bold cyan]AI — recommended follow-up tools[/bold cyan] "
+                        "[dim](advisory only; Blackbox Recon does not run these)[/dim]"
+                    )
+                    nst = Table(title="Suggested next moves", box=box.ROUNDED)
+                    nst.add_column("Tool", style="cyan", max_width=18)
+                    nst.add_column("Objective", style="white", max_width=36)
+                    nst.add_column("Example CLI (placeholders)", style="dim", max_width=44)
+                    for row in analysis.recommended_next_steps[:8]:
+                        nst.add_row(
+                            row.get("tool", "—") or "—",
+                            (row.get("objective") or "—")[:200],
+                            (row.get("example_cli") or "—")[:200],
+                        )
+                    console.print(nst)
+                    console.print(
+                        "[dim]Validate against ROE/scope before running any command. "
+                        "Prefer engagement-gated runs and your own wordlists/paths.[/dim]"
+                    )
                 
             except Exception as e:
                 console.print(f"[yellow][!] AI analysis failed: {e}[/yellow]")
@@ -666,6 +699,27 @@ def generate_markdown_report(results: dict, output_file: str):
             f.write("## AI Analysis\n\n")
             f.write(results["ai_analysis"].get("technical_analysis", ""))
             f.write("\n\n")
+            steps = results["ai_analysis"].get("recommended_next_steps") or []
+            if steps:
+                f.write("### AI — advisory next moves (not executed)\n\n")
+                f.write(
+                    "These are model-suggested follow-ups only. Validate against ROE/scope before running.\n\n"
+                )
+                f.write("| Tool | Objective | Example CLI | Risk notes |\n")
+                f.write("|------|-------------|-------------|------------|\n")
+
+                def _md_cell(s: str, max_len: int = 120) -> str:
+                    t = (s or "").replace("|", "\\|").replace("\n", " ")
+                    return (t[: max_len - 3] + "...") if len(t) > max_len else t
+
+                for row in steps[:8]:
+                    f.write(
+                        f"| {_md_cell(str(row.get('tool', '')))} | "
+                        f"{_md_cell(str(row.get('objective', '')))} | "
+                        f"{_md_cell(str(row.get('example_cli', '')), 160)} | "
+                        f"{_md_cell(str(row.get('risk_notes', '')))} |\n"
+                    )
+                f.write("\n")
 
         if results.get("subdomains"):
             f.write("## Subdomains\n\n")

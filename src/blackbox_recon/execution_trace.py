@@ -19,7 +19,7 @@ def _phase_lookup(phase_id: str):
     return None
 
 
-def _banner_line(ch: str = "#", width: int = 70) -> str:
+def _banner_line(ch: str = "─", width: int = 68) -> str:
     return ch * width
 
 
@@ -60,13 +60,13 @@ class PhaseTracer:
         self._ensure_list().append(self._entry)
         if self.echo:
             print()
-            print(_banner_line("#", 72))
-            print(f"##  PTES {phase_id} — {title}")
+            print(_banner_line("─", 72))
+            print(f"  PTES {phase_id} · {title}")
             if ptes:
-                print(f"##  {ptes}")
-            print(_banner_line("#", 72))
+                print(f"  {ptes.replace('>', '›')}")
+            print(_banner_line("─", 72))
             for line in stack_lines:
-                print(f"  • {line}")
+                print(f"    · {line}")
 
     def note_command(self, label: str, command: str, **extra: Any) -> None:
         if not self._entry:
@@ -109,10 +109,10 @@ class PhaseTracer:
         self._ensure_list().append(entry)
         if self.echo:
             print()
-            print(_banner_line("-", 72))
-            print(f"##  PTES {phase_id} — {title}  [SKIPPED]")
+            print(_banner_line("─", 72))
+            print(f"  PTES {phase_id} · {title}  [skipped]")
             print(f"    Reason: {reason}")
-            print(_banner_line("-", 72))
+            print(_banner_line("─", 72))
 
 
 def summarize_execution_trace(trace: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -143,16 +143,16 @@ def print_execution_recap(results: Dict[str, Any], *, echo: bool = True) -> None
     if not echo or not trace:
         return
     print()
-    print(_banner_line("=", 72))
-    print("[+] PTES-style recon execution recap (see recon_phase_trace in JSON for full commands)")
-    print(_banner_line("=", 72))
+    print(_banner_line("─", 72))
+    print("[+] Execution recap (full commands in JSON: recon_phase_trace)")
+    print(_banner_line("─", 72))
     for row in trace:
         st = row.get("status", "?")
         pid = row.get("phase_id", "?")
         name = row.get("phase_name", "")
         ncmd = len(row.get("commands_executed") or [])
         detail = (row.get("detail") or "")[:120]
-        print(f"  {pid} [{st}] {name} — {ncmd} command line(s) logged")
+        print(f"  {pid}  [{st}]  {name}  ·  {ncmd} command(s)")
         if detail and st != "skipped":
-            print(f"         └─ {detail}")
-    print(_banner_line("=", 72))
+            print(f"      {detail}")
+    print(_banner_line("─", 72))
