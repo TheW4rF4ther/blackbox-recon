@@ -15,6 +15,7 @@ def _short(value: Any, n: int = 220) -> str:
 
 
 def _phase_command(results: Dict[str, Any], phase_id: str, label_contains: Optional[str] = None) -> Optional[str]:
+    candidates: List[str] = []
     for phase in results.get("recon_phase_trace") or []:
         if phase.get("phase_id") != phase_id:
             continue
@@ -24,8 +25,12 @@ def _phase_command(results: Dict[str, Any], phase_id: str, label_contains: Optio
             if not command:
                 continue
             if label_contains is None or label_contains.lower() in label.lower():
-                return str(command)
-    return None
+                candidates.append(str(command))
+    if not candidates:
+        return None
+    # Prefer actual command lines over binary-path metadata like /usr/bin/nmap.
+    candidates.sort(key=lambda c: (" " not in c, len(c)))
+    return candidates[0]
 
 
 def _phase_commands(results: Dict[str, Any], phase_id: str, label_contains: Optional[str] = None) -> List[str]:
@@ -100,7 +105,7 @@ def _nmap_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         signals.append("SSH exposed")
     if any(int(p.get("port") or 0) in (80, 443) for p in ports):
         signals.append("Web service exposed")
-    return _result("nmap", "Port and service discovery", "completed", _phase_command(results, "M3", "nmap"), lines, signals, list({str(p.get("host")) for p in ports if p.get("host")}))
+    return _result("nmap", "Port and service discovery", "completed", _phase_command(results, "M3", "nmap_aggressive") or _phase_command(results, "M3", "nmap"), lines, signals, list({str(p.get("host")) for p in ports if p.get("host")}))
 
 
 def _dns_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -124,13 +129,11 @@ def _gobuster_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     lines: List[str] = []
     assets: List[str] = []
     total_hits = 0
-    statuses: List[str] = []
     for scan in scans:
         base = str(scan.get("base_url") or "")
         assets.append(base)
         hits = scan.get("findings_interesting") or []
         total_hits += len(hits)
-        statuses.append(f"{base}: {scan.get('status') or 'completed'}")
         if hits:
             lines.append(f"{base}: {len(hits)} interesting path(s)")
             for h in hits[:10]:
@@ -144,11 +147,10 @@ def _gobuster_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     command = " | ".join(cmds[:3]) if cmds else None
     if len(cmds) > 3:
         command += f" | +{len(cmds)-3} more"
-    return _result("gobuster/dirb", "Web content discovery across discovered HTTP(S) services", "completed", command, lines, ["interesting paths found" if total_hits else "no flagged paths", *statuses[:3]], sorted(set(assets)))
+    return _result("gobuster/dirb", "Web content discovery across discovered HTTP(S) services", "completed", command, lines, ["interesting paths found" if total_hits else "no flagged paths"], sorted(set(assets)))
 
 
 def _http_header_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    # Keep this only if it provides something a tester could actually use.
     rows = _http_rows(results)
     lines: List[str] = []
     signals: List[str] = []
