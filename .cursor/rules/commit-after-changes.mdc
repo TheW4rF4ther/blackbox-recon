@@ -1,0 +1,16 @@
+---
+description: Commit every code change so Kali test pulls stay current
+alwaysApply: true
+---
+
+# Git commit workflow
+
+The maintainer pulls this repo on Kali immediately after changes to run tests.
+
+**After any substantive edit** to this codebase (source, tests, config, docs that ship with the tool):
+
+1. Run relevant tests if practical (`pytest`, smoke checks).
+2. **`git add`** the touched paths and **`git commit`** with a short, imperative message explaining what changed and why.
+3. Remind them the branch is ready to **`git push`** if the remote should update (the agent may not have push credentials).
+
+Do not leave the working tree dirty with completed work. If a change is experimental or incomplete, use a WIP commit message or a short-lived branch only after confirming that matches what the user wants.
