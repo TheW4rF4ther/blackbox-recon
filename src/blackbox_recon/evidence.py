@@ -19,6 +19,7 @@ ObservationType = Literal[
     "technology_fingerprint",
     "negative_result",
     "tool_error",
+    "coverage_context",
 ]
 
 Confidence = Literal["high", "medium", "low"]
@@ -86,6 +87,25 @@ def build_evidence_records(results: Dict[str, Any]) -> List[EvidenceRecord]:
     def _next_id(phase: str) -> str:
         counters[phase] = counters.get(phase, 0) + 1
         return f"EVID-{phase}-{counters[phase]:03d}"
+
+    if _target_is_bare_ip(target):
+        out.append(
+            EvidenceRecord(
+                id=_next_id("CTX"),
+                phase_id="CTX",
+                source_tool="blackbox_recon",
+                command=None,
+                target=target,
+                asset=target,
+                observation_type="coverage_context",
+                observed_value={
+                    "target_type": "bare_ip",
+                    "dns_bruteforce_expected_yield": "low",
+                },
+                confidence="high",
+                raw_ref="scan_context",
+            )
+        )
 
     # M1 — subdomains (only rows with DNS or HTTP signal to avoid empty-label noise)
     for i, s in enumerate(results.get("subdomains") or []):
@@ -359,7 +379,7 @@ def build_deterministic_findings(evidence: List[EvidenceRecord], results: Dict[s
 
     # Bare IP — DNS coverage
     if _target_is_bare_ip(target):
-        m1_ids = [e.id for e in evidence if e.phase_id == "M1"]
+        ctx_ids = [e.id for e in evidence if e.observation_type == "coverage_context" and e.phase_id == "CTX"]
         findings.append(
             Finding(
                 id=_fid(),
@@ -368,7 +388,7 @@ def build_deterministic_findings(evidence: List[EvidenceRecord], results: Dict[s
                 severity="informational",
                 status="confirmed",
                 affected_assets=[target],
-                evidence_ids=m1_ids[:5],
+                evidence_ids=ctx_ids,
                 impact="Subdomain-style labels against an IP are usually low-yield versus an apex domain.",
                 recommendation="When possible, scope an apex hostname for DNS and web asset mapping.",
                 validation="Re-run subdomain module against the domain apex if in scope.",

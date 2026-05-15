@@ -707,13 +707,23 @@ class AnalysisResult:
     technical_analysis: str
     confidence_score: float
     recommended_next_steps: List[Dict[str, Any]] = field(default_factory=list)
+    ai_status: str = field(default="ok")
+    ai_discard_reason: Optional[str] = field(default=None)
+    ai_enrichment: Optional[Dict[str, Any]] = field(default=None)
+    raw_llm_text: Optional[str] = field(default=None)
 
 
 class AIProvider(ABC):
     """Abstract base class for AI providers."""
-    
+
     @abstractmethod
-    def analyze(self, recon_data: Dict[str, Any], prompt_template: str) -> str:
+    def analyze(
+        self,
+        recon_data: Dict[str, Any],
+        prompt_template: str,
+        *,
+        strict_json_evidence: bool = False,
+    ) -> str:
         """Send data to AI for analysis."""
         pass
 
@@ -733,8 +743,15 @@ class OpenAIProvider(AIProvider):
         except ImportError:
             raise ImportError("Install openai package: pip install openai")
     
-    def analyze(self, recon_data: Dict[str, Any], prompt_template: str) -> str:
+    def analyze(
+        self,
+        recon_data: Dict[str, Any],
+        prompt_template: str,
+        *,
+        strict_json_evidence: bool = False,
+    ) -> str:
         """Analyze with OpenAI."""
+        del strict_json_evidence
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -765,8 +782,15 @@ class ClaudeProvider(AIProvider):
         except ImportError:
             raise ImportError("Install anthropic package: pip install anthropic")
     
-    def analyze(self, recon_data: Dict[str, Any], prompt_template: str) -> str:
+    def analyze(
+        self,
+        recon_data: Dict[str, Any],
+        prompt_template: str,
+        *,
+        strict_json_evidence: bool = False,
+    ) -> str:
         """Analyze with Claude."""
+        del strict_json_evidence
         try:
             response = self.client.messages.create(
                 model=self.model,
@@ -792,8 +816,20 @@ class LocalProvider(AIProvider):
         self.headers = {"Content-Type": "application/json"}
         self.last_recommended_next_steps: List[Dict[str, Any]] = []
     
-    def analyze(self, recon_data: Dict[str, Any], prompt_template: str) -> str:
+    def analyze(
+        self,
+        recon_data: Dict[str, Any],
+        prompt_template: str,
+        *,
+        strict_json_evidence: bool = False,
+    ) -> str:
         """Analyze with local LLM."""
+        from .ai_json_enrichment import (
+            JSON_ENRICHMENT_SYSTEM_PROMPT,
+            evidence_package_json_for_llm,
+            strip_think_spans,
+        )
+
         if not self.model:
             return (
                 "Error calling local LLM: missing model id. "
@@ -801,41 +837,53 @@ class LocalProvider(AIProvider):
             )
         try:
             self.last_recommended_next_steps = []
-            payload_json = shrink_recon_payload_for_llm(
-                recon_data,
-                max_chars=3400,
-                max_subdomains=10,
-                max_ports=30,
-                max_tech=6,
-            )
-            user_content = (
-                f"{prompt_template.strip()}\n\n"
-                "DATA: The following JSON is authorized Blackbox Recon output (subdomains, open ports with "
-                "service/version when detected, technologies). Treat it as summarized tool output under the INPUT "
-                "rules above.\n\n"
-                f"JSON:\n{payload_json}"
-            )
+            if strict_json_evidence:
+                payload_json = evidence_package_json_for_llm(recon_data)
+                user_content = (
+                    f"{prompt_template.strip()}\n\n"
+                    "INPUT: The following JSON is the authoritative `evidence_package` from Blackbox Recon "
+                    "(assessment metadata, typed evidence, deterministic_findings, attack paths, coverage notes). "
+                    "Follow the system rules; return JSON only.\n\n"
+                    f"{payload_json}"
+                )
+                sys_msg = JSON_ENRICHMENT_SYSTEM_PROMPT
+                max_out = 4096
+            else:
+                payload_json = shrink_recon_payload_for_llm(
+                    recon_data,
+                    max_chars=3400,
+                    max_subdomains=10,
+                    max_ports=30,
+                    max_tech=6,
+                )
+                user_content = (
+                    f"{prompt_template.strip()}\n\n"
+                    "DATA: The following JSON is authorized Blackbox Recon output (subdomains, open ports with "
+                    "service/version when detected, technologies). Treat it as summarized tool output under the INPUT "
+                    "rules above.\n\n"
+                    f"JSON:\n{payload_json}"
+                )
+                sys_msg = SYSTEM_PROMPT
+                max_out = 8192
+
             payload = {
                 "model": self.model,
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": SYSTEM_PROMPT,
-                    },
+                    {"role": "system", "content": sys_msg},
                     {"role": "user", "content": user_content},
                 ],
                 "temperature": 0.15,
-                "max_tokens": 8192,
+                "max_tokens": max_out,
                 "stream": False,
                 "chat_template_kwargs": {"enable_thinking": False},
                 "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
             }
-            
+
             response = requests.post(
                 f"{self.url}/chat/completions",
                 headers=self.headers,
                 json=payload,
-                timeout=120
+                timeout=120,
             )
             response.raise_for_status()
             body = response.json()
@@ -853,6 +901,8 @@ class LocalProvider(AIProvider):
                     f"Response (truncated): {json.dumps(body, ensure_ascii=False)[:1800]}"
                 )
             self.last_recommended_next_steps = []
+            if strict_json_evidence:
+                return strip_think_spans(text)
             body, blob = split_next_steps_marker(text)
             if blob:
                 self.last_recommended_next_steps = parse_recommended_next_steps(blob)
@@ -873,35 +923,71 @@ class OllamaProvider(AIProvider):
         self.url = url.rstrip('/')
         self.model = model
     
-    def analyze(self, recon_data: Dict[str, Any], prompt_template: str) -> str:
+    def analyze(
+        self,
+        recon_data: Dict[str, Any],
+        prompt_template: str,
+        *,
+        strict_json_evidence: bool = False,
+    ) -> str:
         """Analyze with Ollama."""
+        from .ai_json_enrichment import (
+            JSON_ENRICHMENT_SYSTEM_PROMPT,
+            evidence_package_json_for_llm,
+            strip_think_spans,
+        )
+
         try:
+            if strict_json_evidence:
+                user_body = (
+                    f"{prompt_template.strip()}\n\n"
+                    "INPUT: The following JSON is the authoritative `evidence_package` from Blackbox Recon. "
+                    "Return JSON only per the instructions.\n\n"
+                    f"{evidence_package_json_for_llm(recon_data)}"
+                )
+                messages = [
+                    {"role": "system", "content": JSON_ENRICHMENT_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_body},
+                ]
+                num_predict = 4096
+            else:
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": prompt_template
+                        + "\n\n"
+                        + shrink_recon_payload_for_llm(
+                            recon_data,
+                            max_chars=12000,
+                            max_subdomains=30,
+                            max_ports=80,
+                            max_tech=15,
+                        ),
+                    },
+                ]
+                num_predict = 2048
+
             payload = {
                 "model": self.model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt_template + "\n\n" + shrink_recon_payload_for_llm(
-                        recon_data,
-                        max_chars=12000,
-                        max_subdomains=30,
-                        max_ports=80,
-                        max_tech=15,
-                    )},
-                ],
+                "messages": messages,
                 "stream": False,
                 "options": {
                     "temperature": 0.3,
-                    "num_predict": 2048,
+                    "num_predict": num_predict,
                 },
             }
-            
+
             response = requests.post(
                 f"{self.url}/api/chat",
                 json=payload,
-                timeout=120
+                timeout=120,
             )
             response.raise_for_status()
-            return response.json()["message"]["content"]
+            content = response.json()["message"]["content"]
+            if strict_json_evidence:
+                return strip_think_spans(content)
+            return content
         except HTTPError as exc:
             body = ""
             if exc.response is not None:
@@ -972,14 +1058,105 @@ Be specific, actionable, and focus on what a penetration tester should prioritiz
         else:
             raise ValueError(f"Unknown provider: {provider}. Choose: openai, claude, local, ollama")
     
-    def analyze_recon_data(self, recon_data: Dict[str, Any]) -> AnalysisResult:
+    def analyze_recon_data(
+        self,
+        recon_data: Dict[str, Any],
+        *,
+        show_ai_narrative: bool = False,
+        save_ai_raw: bool = False,
+    ) -> AnalysisResult:
         """Analyze reconnaissance data and return structured results."""
+        from .ai_json_enrichment import (
+            LOCAL_JSON_ENRICHMENT_PROMPT,
+            ai_output_fails_quality_gate,
+            format_enrichment_markdown,
+            next_steps_to_legacy_list,
+            parse_ai_enrichment_json,
+            strip_think_spans,
+        )
+
         rprint(
             f"[bold cyan]{escape('[AI]')}[/bold cyan] Analyzing attack surface with "
             f"[yellow]{escape(self.provider_name)}[/yellow]…"
         )
-        prompt = self.ANALYSIS_PROMPT if self.provider_name != "local" else LOCAL_ANALYSIS_PROMPT
-        raw_analysis = self.provider.analyze(recon_data, prompt)
+        atk = list(recon_data.get("deterministic_attack_paths") or [])
+        pri = list(recon_data.get("deterministic_findings") or [])
+
+        if self.provider_name in ("local", "ollama"):
+            raw_analysis = self.provider.analyze(
+                recon_data,
+                LOCAL_JSON_ENRICHMENT_PROMPT,
+                strict_json_evidence=True,
+            )
+            raw_llm_text = (raw_analysis or "") if save_ai_raw else None
+            clean = strip_think_spans(raw_analysis or "")
+            if (raw_analysis or "").strip().startswith("Error"):
+                return AnalysisResult(
+                    attack_paths=atk,
+                    prioritized_findings=pri,
+                    correlations=[],
+                    executive_summary="",
+                    technical_analysis=str(raw_analysis or "").strip(),
+                    confidence_score=0.0,
+                    recommended_next_steps=[],
+                    ai_status="error_provider",
+                    ai_discard_reason="provider_error",
+                    ai_enrichment=None,
+                    raw_llm_text=raw_llm_text,
+                )
+            discard_reason: Optional[str] = None
+            enrichment: Optional[Dict[str, Any]] = None
+            if ai_output_fails_quality_gate(clean):
+                discard_reason = "quality_gate"
+            else:
+                enrichment, err = parse_ai_enrichment_json(clean)
+                if err:
+                    discard_reason = err
+                    enrichment = None
+            if enrichment:
+                steps = next_steps_to_legacy_list(enrichment.get("recommended_next_steps") or [])
+                exec_s = (enrichment.get("executive_summary") or "").strip()[:500]
+                md = format_enrichment_markdown(enrichment)
+                panel_text = md if show_ai_narrative else ""
+                return AnalysisResult(
+                    attack_paths=atk,
+                    prioritized_findings=pri,
+                    correlations=[],
+                    executive_summary=exec_s,
+                    technical_analysis=panel_text or md,
+                    confidence_score=0.85,
+                    recommended_next_steps=steps,
+                    ai_status="applied",
+                    ai_discard_reason=None,
+                    ai_enrichment=enrichment,
+                    raw_llm_text=raw_llm_text,
+                )
+            status = "discarded_quality_gate" if discard_reason == "quality_gate" else "discarded_parse"
+            note = (
+                "AI enrichment discarded: model output failed quality checks (planning/scaffolding text). "
+                "Deterministic evidence-backed report retained."
+                if discard_reason == "quality_gate"
+                else (
+                    f"AI enrichment could not be parsed or validated ({discard_reason}). "
+                    "Deterministic evidence-backed report retained."
+                )
+            )
+            return AnalysisResult(
+                attack_paths=atk,
+                prioritized_findings=pri,
+                correlations=[],
+                executive_summary="",
+                technical_analysis=note,
+                confidence_score=0.0,
+                recommended_next_steps=[],
+                ai_status=status,
+                ai_discard_reason=discard_reason,
+                ai_enrichment=None,
+                raw_llm_text=raw_llm_text,
+            )
+
+        prompt = self.ANALYSIS_PROMPT
+        raw_analysis = self.provider.analyze(recon_data, prompt, strict_json_evidence=False)
 
         steps: List[Dict[str, Any]] = []
         narrative = raw_analysis
@@ -991,8 +1168,6 @@ Be specific, actionable, and focus on what a penetration tester should prioritiz
 
         exec_src = narrative or ""
         executive = exec_src[:500] if len(exec_src) > 500 else exec_src
-        atk = list(recon_data.get("deterministic_attack_paths") or [])
-        pri = list(recon_data.get("deterministic_findings") or [])
         return AnalysisResult(
             attack_paths=atk,
             prioritized_findings=pri,
@@ -1001,6 +1176,10 @@ Be specific, actionable, and focus on what a penetration tester should prioritiz
             technical_analysis=narrative,
             confidence_score=0.85,
             recommended_next_steps=steps,
+            ai_status="ok",
+            ai_discard_reason=None,
+            ai_enrichment=None,
+            raw_llm_text=(raw_analysis or "") if save_ai_raw else None,
         )
     
     def generate_attack_path(self, entry_point: str, target_type: str) -> Dict[str, Any]:

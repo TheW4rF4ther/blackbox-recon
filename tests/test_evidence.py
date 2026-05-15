@@ -71,3 +71,23 @@ def test_evidence_and_summary_http_count():
     pkg = build_evidence_package(results, ["portscan", "subdomain"], lab_mode=True)
     assert pkg["assessment"]["mode"] == "lab"
     assert len(pkg["evidence"]) >= 3
+
+
+def test_bare_ip_coverage_finding_links_ctx_evidence():
+    results = {
+        "target": "203.0.113.5",
+        "subdomains": [],
+        "dns_intelligence": {"nslookups": []},
+        "ports": [],
+        "technologies": [],
+        "web_content_discovery": {"directory_scans": []},
+        "summary": {},
+        "engagement": {},
+    }
+    ev = build_evidence_records(results)
+    ctx = [e for e in ev if e.observation_type == "coverage_context"]
+    assert len(ctx) == 1
+    assert ctx[0].id.startswith("EVID-CTX")
+    findings = build_deterministic_findings(ev, results)
+    cov = next(f for f in findings if f.finding_code == "BBR-COVERAGE-001")
+    assert ctx[0].id in cov.evidence_ids

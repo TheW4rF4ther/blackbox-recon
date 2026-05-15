@@ -178,6 +178,16 @@ def print_banner():
     default=None,
     help='Base for Aesa-style workspaces (default: ~/.blackbox-recon/workspaces).',
 )
+@click.option(
+    '--show-ai-narrative',
+    is_flag=True,
+    help='Print the AI enrichment panel for local/Ollama (structured JSON → markdown). Default: off.',
+)
+@click.option(
+    '--save-ai-raw',
+    is_flag=True,
+    help='Store raw LLM response in saved JSON (ai_analysis.raw_llm_text) for local/Ollama.',
+)
 @click.option('--verbose', '-v', is_flag=True, help='Verbose output')
 @click.version_option(version='1.0.0', prog_name='blackbox-recon')
 def recon_main(
@@ -200,6 +210,8 @@ def recon_main(
     action_reason,
     workspace_root,
     verbose,
+    show_ai_narrative,
+    save_ai_raw,
 ):
     """Blackbox Recon - AI-Augmented Reconnaissance for Penetration Testers."""
     
@@ -439,30 +451,77 @@ def recon_main(
                         model=ai_model
                     )
                 
-                console.print("\n[bold green]AI analysis[/bold green] [dim]· generating report…[/dim]")
-                analysis = analyzer.analyze_recon_data(results)
-
-                raw_ta = (analysis.technical_analysis or "").strip()
-                if not raw_ta:
-                    panel_body = Text(
-                        "The model returned no visible analysis text. In LM Studio: raise max tokens, "
-                        "disable extended reasoning for this model, or use a non-thinking chat model. "
-                        "Raw JSON is still in the saved report.",
-                        style="dim",
-                    )
-                else:
-                    panel_body = build_analysis_panel_text(raw_ta)
-                console.print(
-                    Panel(
-                        panel_body,
-                        title="[bold bright_white]Attack surface analysis[/bold bright_white]",
-                        title_align="left",
-                        subtitle="[dim italic]Advisory triage from this run · not exploitation guidance[/dim italic]",
-                        border_style="green",
-                        padding=(1, 2),
-                    )
+                console.print("\n[bold green]AI analysis[/bold green] [dim]· generating enrichment…[/dim]")
+                analysis = analyzer.analyze_recon_data(
+                    results,
+                    show_ai_narrative=show_ai_narrative,
+                    save_ai_raw=save_ai_raw,
                 )
-                
+
+                is_json_local = ai_mode in ("local", "ollama")
+                ta = (analysis.technical_analysis or "").strip()
+
+                if analysis.ai_status == "error_provider":
+                    console.print(f"[yellow][!][/yellow] {ta or 'AI provider error.'}")
+                elif analysis.ai_status != "applied":
+                    console.print(f"[yellow][!][/yellow] {ta}")
+                elif is_json_local:
+                    if show_ai_narrative and ta:
+                        console.print(
+                            Panel(
+                                build_analysis_panel_text(ta),
+                                title="[bold bright_white]AI structured enrichment[/bold bright_white]",
+                                title_align="left",
+                                subtitle="[dim italic]Validated JSON enrichment · deterministic findings remain authoritative[/dim italic]",
+                                border_style="green",
+                                padding=(1, 2),
+                            )
+                        )
+                    elif show_ai_narrative and not ta:
+                        console.print(
+                            Panel(
+                                Text(
+                                    "The model returned no visible enrichment text after JSON validation.",
+                                    style="dim",
+                                ),
+                                title="[bold bright_white]AI structured enrichment[/bold bright_white]",
+                                title_align="left",
+                                border_style="yellow",
+                                padding=(1, 2),
+                            )
+                        )
+                    else:
+                        console.print(
+                            "[dim]AI enrichment applied (structured). "
+                            "Omitting narrative panel; see report appendix or use --show-ai-narrative.[/dim]"
+                        )
+                else:
+                    if ta:
+                        console.print(
+                            Panel(
+                                build_analysis_panel_text(ta),
+                                title="[bold bright_white]Attack surface analysis[/bold bright_white]",
+                                title_align="left",
+                                subtitle="[dim italic]Advisory triage from this run · not exploitation guidance[/dim italic]",
+                                border_style="green",
+                                padding=(1, 2),
+                            )
+                        )
+                    else:
+                        console.print(
+                            Panel(
+                                Text(
+                                    "The model returned no visible analysis text. "
+                                    "Raw JSON is still in the saved report.",
+                                    style="dim",
+                                ),
+                                title="[bold bright_white]Attack surface analysis[/bold bright_white]",
+                                title_align="left",
+                                border_style="yellow",
+                                padding=(1, 2),
+                            )
+                        )
+
                 # Add analysis to results
                 results['ai_analysis'] = {
                     'executive_summary': analysis.executive_summary,
@@ -471,6 +530,10 @@ def recon_main(
                     'recommended_next_steps': analysis.recommended_next_steps,
                     'attack_paths': analysis.attack_paths,
                     'prioritized_findings': analysis.prioritized_findings,
+                    'ai_status': analysis.ai_status,
+                    'ai_discard_reason': analysis.ai_discard_reason,
+                    'ai_enrichment': analysis.ai_enrichment,
+                    'raw_llm_text': analysis.raw_llm_text,
                 }
 
                 if analysis.recommended_next_steps:
@@ -763,15 +826,30 @@ def generate_markdown_report(results: dict, output_file: str):
                 )
             f.write("\n")
 
-        if results.get("ai_analysis"):
-            f.write("### Narrative enrichment (model-generated)\n\n")
-            f.write(
-                "*The following prose is optional model output for triage context only. "
-                "It does not supersede the evidence-backed technical assessment above.*\n\n"
-            )
-            f.write(results["ai_analysis"].get("technical_analysis", ""))
-            f.write("\n\n")
-            steps = results["ai_analysis"].get("recommended_next_steps") or []
+        ai = results.get("ai_analysis") or {}
+        if ai:
+            st = str(ai.get("ai_status") or "ok")
+            ta_body = (ai.get("technical_analysis") or "").strip()
+            steps = ai.get("recommended_next_steps") or []
+
+            if st == "applied" and ta_body:
+                f.write("### Structured AI enrichment\n\n")
+                f.write(
+                    "*Parsed from model JSON output. Deterministic findings in the technical assessment remain authoritative.*\n\n"
+                )
+                f.write(ta_body + "\n\n")
+            elif st == "ok" and ta_body:
+                f.write("### Narrative enrichment (model-generated)\n\n")
+                f.write(
+                    "*Optional model prose for triage context only; it does not supersede deterministic evidence.*\n\n"
+                )
+                f.write(ta_body + "\n\n")
+            elif st not in ("ok", "applied") and ta_body:
+                f.write("### AI enrichment status\n\n")
+                f.write(ta_body + "\n\n")
+                if ai.get("ai_discard_reason"):
+                    f.write(f"- **Detail:** `{ai['ai_discard_reason']}`\n\n")
+
             if steps:
                 f.write("### AI — advisory next moves (not executed)\n\n")
                 f.write(
