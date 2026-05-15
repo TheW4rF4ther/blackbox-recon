@@ -150,6 +150,9 @@ def create_default_config() -> str:
     """Create a default configuration file."""
     config_content = '''# Blackbox Recon Configuration
 # Place this file at ~/.blackbox-recon/config.yaml
+#
+# Lab quick test (no engagement YAML): export BLACKBOX_RECON_LAB=1
+#   Same as CLI flags --lab or --no-engagement-gates. Unset for client runs with --engagement.
 
 # AI Provider Settings
 # Supported: openai, claude, local (LM Studio, etc.), ollama

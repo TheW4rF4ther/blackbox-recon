@@ -133,12 +133,13 @@ def print_banner():
     '--engagement',
     'engagement_file',
     type=click.Path(exists=True, dir_okay=False),
-    help='YAML/JSON engagement record (authorization, scope, ROE refs). Required unless --no-engagement-gates.',
+    help='YAML/JSON engagement record. Required unless --lab / --no-engagement-gates or BLACKBOX_RECON_LAB=1.',
 )
 @click.option(
     '--no-engagement-gates',
+    '--lab',
     is_flag=True,
-    help='Skip engagement file, methodology gates, and workspace (lab/CI only; not for client work).',
+    help='Skip engagement file, gates, and workspace (same as env BLACKBOX_RECON_LAB=1). Lab/CI only.',
 )
 @click.option(
     '--action-reason',
@@ -200,7 +201,11 @@ def recon_main(
     
     if verbose:
         cfg.verbose = True
-    
+
+    lab_env = os.environ.get("BLACKBOX_RECON_LAB", "").strip().lower() in ("1", "true", "yes", "on")
+    if lab_env:
+        no_engagement_gates = True
+
     # Override config with CLI options
     if full:
         modules_list = ["subdomain", "portscan", "technology", "vulnscan"]
@@ -285,7 +290,7 @@ def recon_main(
                 console.print("[red][!] Engagement record required for execution.[/red]")
                 console.print(
                     "[dim]Provide --engagement path/to/engagement.yaml (authorization, scope, action_reason) "
-                    "or pass --no-engagement-gates only for lab/CI.[/dim]"
+                    "or use --lab / --no-engagement-gates / export BLACKBOX_RECON_LAB=1 only for lab/CI.[/dim]"
                 )
                 sys.exit(1)
             try:
@@ -313,7 +318,8 @@ def recon_main(
                 sys.exit(1)
         else:
             console.print(
-                "[yellow][!] --no-engagement-gates: no authorization/scope/workspace enforcement (lab only).[/yellow]"
+                "[yellow][!] Lab mode: engagement gates off (--lab, --no-engagement-gates, or BLACKBOX_RECON_LAB=1). "
+                "No authorization/scope/workspace enforcement.[/yellow]"
             )
 
         engine = ReconEngine(recon_config, engagement_rt)
