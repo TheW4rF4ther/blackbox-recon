@@ -1,7 +1,8 @@
-"""Rich terminal dashboard for Blackbox Recon operator-facing results.
+"""Results-first Rich terminal dashboard for Blackbox Recon.
 
-This module turns normalized recon results into concise, readable terminal
-sections so the operator does not have to infer meaning from raw phase logs.
+This module prints observed scan results directly. It intentionally avoids
+advice-heavy wording in the primary terminal view: pentesters need facts first,
+then can inspect JSON/report detail for context and recommendations.
 """
 
 from __future__ import annotations
@@ -41,17 +42,28 @@ def _status_style(status: str) -> str:
     return "yellow"
 
 
-def _short(s: Any, n: int = 84) -> str:
-    text = " ".join(str(s or "").split())
-    return text if len(text) <= n else text[: n - 1] + "..."
+def _short(value: Any, n: int = 90) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= n else text[: n - 3] + "..."
 
 
 def _count(rows: Iterable[Any]) -> int:
     return len(list(rows or []))
 
 
+def _kv(d: Dict[str, Any], keys: List[str], limit: int = 5) -> str:
+    parts: List[str] = []
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, "", [], {}):
+            parts.append(f"{k}={_short(v, 45)}")
+        if len(parts) >= limit:
+            break
+    return "; ".join(parts) or "-"
+
+
 def render_operator_dashboard(results: Dict[str, Any]) -> None:
-    """Print a structured, operator-readable dashboard for the completed run."""
+    """Print observed results in tables for pentester triage."""
     target = results.get("target") or "target"
     summary = results.get("summary") or {}
     findings = list(results.get("deterministic_findings") or [])
@@ -61,10 +73,9 @@ def render_operator_dashboard(results: Dict[str, Any]) -> None:
         Panel(
             Text.from_markup(
                 f"[bold bright_white]{target}[/bold bright_white]\n"
-                "Evidence-backed scan results summarized for operator triage. "
-                "Detailed command provenance remains available in `recon_phase_trace`."
+                "Observed scan results. Full raw output, exact commands, and evidence IDs are saved in JSON."
             ),
-            title="[bold cyan]Operator Results Dashboard[/bold cyan]",
+            title="[bold cyan]Blackbox Recon Results[/bold cyan]",
             border_style="cyan",
             padding=(1, 2),
         )
@@ -73,9 +84,12 @@ def render_operator_dashboard(results: Dict[str, Any]) -> None:
     _render_snapshot(summary, findings)
     _render_open_services(results)
     _render_findings(findings)
-    _render_web_posture(results)
-    _render_service_enrichment(results)
-    _render_tool_coverage(results)
+    _render_web_content(results)
+    _render_http_results(results)
+    _render_tls_results(results)
+    _render_web_fingerprints(results)
+    _render_service_dns_screenshots(results)
+    _render_tool_execution(results)
 
 
 def _render_snapshot(summary: Dict[str, Any], findings: List[Dict[str, Any]]) -> None:
@@ -84,23 +98,25 @@ def _render_snapshot(summary: Dict[str, Any], findings: List[Dict[str, Any]]) ->
         sev = str(f.get("severity") or "unknown")
         sev_counts[sev] = sev_counts.get(sev, 0) + 1
 
-    table = Table(title="Run Snapshot", box=box.ROUNDED, header_style="bold cyan")
-    table.add_column("Area", style="bold white")
-    table.add_column("Result", style="bright_white", justify="right")
-    table.add_column("Operator meaning", style="dim")
+    table = Table(title="Result Counts", box=box.ROUNDED, header_style="bold cyan")
+    table.add_column("Metric", style="bold white")
+    table.add_column("Count", style="bright_white", justify="right")
+    table.add_column("Detail", style="dim")
     rows = [
-        ("Open TCP ports", summary.get("total_open_ports", summary.get("open_tcp_ports", 0)), "Confirmed network exposure"),
-        ("HTTP/S services", summary.get("http_services_detected", 0), "Web attack surface candidates"),
-        ("HTTP header URLs", summary.get("http_header_urls_analyzed", 0), "Browser hardening sampled"),
-        ("TLS services", summary.get("tls_services_analyzed", 0), "Transport posture sampled"),
-        ("Service enum modules", summary.get("service_enum_modules_run", 0), "Service-specific checks executed"),
-        ("Web fingerprint modules", summary.get("web_fingerprint_modules_run", 0), "WhatWeb/WAF style checks"),
-        ("DNS queries", summary.get("dns_record_queries_run", 0), "DNS inventory checks"),
-        ("Screenshots", summary.get("screenshots_captured", 0), "Visual triage evidence"),
+        ("Subdomains", summary.get("total_subdomains", 0), f"HTTP probes with status: {summary.get('subdomain_http_probes_with_status', 0)}"),
+        ("Open TCP ports", summary.get("total_open_ports", summary.get("open_tcp_ports", 0)), ""),
+        ("HTTP/S services", summary.get("http_services_detected", 0), f"URLs targeted: {summary.get('http_urls_targeted', summary.get('web_urls_targeted', 0))}"),
+        ("Directory scans", summary.get("directory_scans", summary.get("web_directory_scans", 0)), f"interesting paths: {summary.get('interesting_paths_found', 0)}"),
+        ("HTTP header checks", summary.get("http_header_urls_analyzed", 0), ""),
+        ("TLS checks", summary.get("tls_services_analyzed", 0), ""),
+        ("Service enum modules", summary.get("service_enum_modules_run", 0), ""),
+        ("Web fingerprint modules", summary.get("web_fingerprint_modules_run", 0), ""),
+        ("DNS queries", summary.get("dns_record_queries_run", 0), ""),
+        ("Screenshots", summary.get("screenshots_captured", 0), ""),
         ("Findings", len(findings), ", ".join(f"{k}:{v}" for k, v in sorted(sev_counts.items())) or "none"),
     ]
-    for area, result, meaning in rows:
-        table.add_row(area, str(result), meaning)
+    for metric, count, detail in rows:
+        table.add_row(metric, str(count), str(detail or "-"))
     console.print(table)
 
 
@@ -108,130 +124,190 @@ def _render_open_services(results: Dict[str, Any]) -> None:
     ports = list(results.get("ports") or [])
     if not ports:
         return
-    table = Table(title="Open Services", box=box.ROUNDED, header_style="bold cyan")
+    table = Table(title="Open TCP Services", box=box.ROUNDED, header_style="bold cyan")
     table.add_column("Host", style="white", no_wrap=True)
     table.add_column("Port", style="bold yellow", justify="right")
     table.add_column("Service", style="cyan")
-    table.add_column("Version / banner", style="dim", overflow="fold")
-    table.add_column("Follow-up", style="bright_white")
-    for row in ports[:20]:
-        port = int(row.get("port") or 0)
-        svc = row.get("service") or "unknown"
-        ver = row.get("version") or row.get("banner") or "-"
-        if port == 22 or str(svc).lower() == "ssh":
-            follow = "Review SSH exposure and algos"
-        elif port in (80, 443) or "http" in str(svc).lower():
-            follow = "Review web/TLS/header posture"
-        else:
-            follow = "Service-specific enum if in scope"
-        table.add_row(str(row.get("host") or ""), str(port), str(svc), _short(ver, 90), follow)
+    table.add_column("Version / banner", style="bright_white", overflow="fold")
+    table.add_column("State", style="green")
+    for row in ports[:30]:
+        table.add_row(
+            str(row.get("host") or ""),
+            str(row.get("port") or ""),
+            str(row.get("service") or "unknown"),
+            _short(row.get("version") or row.get("banner") or "-", 120),
+            str(row.get("state") or "open"),
+        )
     console.print(table)
 
 
 def _render_findings(findings: List[Dict[str, Any]]) -> None:
     if not findings:
         return
-    table = Table(title="Prioritized Evidence-Backed Findings", box=box.ROUNDED, header_style="bold cyan")
+    table = Table(title="Findings", box=box.ROUNDED, header_style="bold cyan")
     table.add_column("ID", style="dim", no_wrap=True)
     table.add_column("Code", style="bold yellow", no_wrap=True, min_width=18)
     table.add_column("Severity", no_wrap=True)
+    table.add_column("Status", style="cyan", no_wrap=True)
     table.add_column("Title", style="white", overflow="fold")
+    table.add_column("Assets", style="bright_white", overflow="fold")
     table.add_column("Evidence", style="dim", justify="right")
-    table.add_column("Operator action", style="bright_white", overflow="fold")
-    for f in findings[:15]:
+    for f in findings[:20]:
         sev = str(f.get("severity") or "")
-        code = str(f.get("finding_code") or "-")
-        evidence = len(f.get("evidence_ids") or [])
-        action = f.get("recommendation") or f.get("validation") or "Review evidence and validate scope."
-        table.add_row(str(f.get("id") or ""), code, f"[{_sev_style(sev)}]{sev}[/]", _short(f.get("title"), 96), str(evidence), _short(action, 110))
+        assets = ", ".join(map(str, (f.get("affected_assets") or [])[:3])) or "-"
+        table.add_row(
+            str(f.get("id") or ""),
+            str(f.get("finding_code") or "-"),
+            f"[{_sev_style(sev)}]{sev}[/]",
+            str(f.get("status") or ""),
+            _short(f.get("title"), 100),
+            _short(assets, 100),
+            str(len(f.get("evidence_ids") or [])),
+        )
     console.print(table)
 
 
-def _render_web_posture(results: Dict[str, Any]) -> None:
-    headers = list((results.get("http_header_analysis") or {}).get("results") or [])
-    webfp = list((results.get("web_fingerprinting") or {}).get("results") or [])
-    tls = list((results.get("tls_analysis") or {}).get("results") or [])
-    if not headers and not webfp and not tls:
+def _render_web_content(results: Dict[str, Any]) -> None:
+    scans = list((results.get("web_content_discovery") or {}).get("directory_scans") or [])
+    if not scans:
         return
-
-    table = Table(title="Web, TLS, and Fingerprinting Posture", box=box.ROUNDED, header_style="bold cyan")
-    table.add_column("Asset", style="white", overflow="fold")
-    table.add_column("Status", style="bold")
-    table.add_column("Signals", style="bright_white", overflow="fold")
-    table.add_column("Recommended read", style="dim", overflow="fold")
-
-    for row in headers[:10]:
-        missing = row.get("missing_security_headers") or []
-        disclosure = row.get("disclosure_headers") or {}
-        sigs = []
-        if missing:
-            sigs.append("missing headers: " + ", ".join(missing[:4]))
-        if disclosure:
-            sigs.append("disclosure: " + ", ".join(disclosure.keys()))
-        table.add_row(str(row.get("url") or row.get("final_url") or ""), str(row.get("status_code") or "-"), _short("; ".join(sigs) or "headers sampled", 130), "Defense-in-depth, not proof of vuln.")
-
-    for row in tls[:8]:
-        asset = f"{row.get('host')}:{row.get('port')}"
-        weak = row.get("weak_signals") or []
-        protos = row.get("supported_protocols") or []
-        if weak:
-            signal = "weak signals: " + ", ".join(map(str, weak[:4]))
-        elif protos:
-            signal = "protocols: " + ", ".join(map(str, protos[:6]))
+    table = Table(title="Web Content Discovery", box=box.ROUNDED, header_style="bold cyan")
+    table.add_column("Base URL", style="white", overflow="fold")
+    table.add_column("Tool", style="cyan")
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Interesting", justify="right", style="yellow")
+    table.add_column("Observed paths / note", style="bright_white", overflow="fold")
+    for scan in scans[:12]:
+        hits = scan.get("findings_interesting") or []
+        if hits:
+            note = ", ".join(f"{h.get('path')}({h.get('status_code')})" for h in hits[:5] if isinstance(h, dict))
         else:
-            signal = "TLS sampled"
-        table.add_row(asset, str(row.get("status") or "-"), _short(signal, 130), "Confirm cipher/protocol policy and cert validity.")
-
-    for row in webfp[:12]:
-        ftypes = [str(f.get("type")) for f in (row.get("findings") or []) if isinstance(f, dict)]
-        signal = f"{row.get('tool')}: {', '.join(ftypes) or 'completed'}"
-        table.add_row(str(row.get("url") or ""), str(row.get("status") or "-"), _short(signal, 130), "Fingerprinting supports inventory, not CVE proof.")
+            note = scan.get("error") or "no flagged paths"
+        table.add_row(
+            str(scan.get("base_url") or ""),
+            str(scan.get("tool") or ""),
+            f"[{_status_style(str(scan.get('status')))}]{scan.get('status')}[/]",
+            str(len(hits)),
+            _short(note, 130),
+        )
     console.print(table)
 
 
-def _render_service_enrichment(results: Dict[str, Any]) -> None:
-    rows = list((results.get("service_enumeration") or {}).get("results") or [])
+def _render_http_results(results: Dict[str, Any]) -> None:
+    rows = list((results.get("http_header_analysis") or {}).get("results") or [])
+    if not rows:
+        return
+    table = Table(title="HTTP Response and Header Results", box=box.ROUNDED, header_style="bold cyan")
+    table.add_column("URL", style="white", overflow="fold")
+    table.add_column("Status", justify="right", style="yellow")
+    table.add_column("Final URL", style="cyan", overflow="fold")
+    table.add_column("Title", style="bright_white", overflow="fold")
+    table.add_column("Missing security headers", style="magenta", overflow="fold")
+    table.add_column("Disclosure headers", style="dim", overflow="fold")
+    for row in rows[:12]:
+        missing = ", ".join(map(str, row.get("missing_security_headers") or [])) or "-"
+        disclosure = row.get("disclosure_headers") or {}
+        disclosure_txt = ", ".join(f"{k}={v}" for k, v in list(disclosure.items())[:4]) or "-"
+        table.add_row(
+            str(row.get("url") or ""),
+            str(row.get("status_code") or "-"),
+            _short(row.get("final_url") or "-", 90),
+            _short(row.get("title") or "-", 80),
+            _short(missing, 120),
+            _short(disclosure_txt, 100),
+        )
+    console.print(table)
+
+
+def _render_tls_results(results: Dict[str, Any]) -> None:
+    rows = list((results.get("tls_analysis") or {}).get("results") or [])
+    if not rows:
+        return
+    table = Table(title="TLS Results", box=box.ROUNDED, header_style="bold cyan")
+    table.add_column("Host:Port", style="white", no_wrap=True)
+    table.add_column("Tool", style="cyan")
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Protocols", style="bright_white", overflow="fold")
+    table.add_column("Certificate", style="dim", overflow="fold")
+    table.add_column("Weak signals", style="magenta", overflow="fold")
+    for row in rows[:10]:
+        cert = row.get("certificate") or {}
+        cert_txt = _kv(cert, ["subject", "issuer", "not_before", "not_after", "subject_alt_name"], limit=3)
+        table.add_row(
+            f"{row.get('host')}:{row.get('port')}",
+            str(row.get("tool") or ""),
+            f"[{_status_style(str(row.get('status')))}]{row.get('status')}[/]",
+            ", ".join(map(str, row.get("supported_protocols") or [])) or "-",
+            _short(cert_txt, 140),
+            _short(", ".join(map(str, row.get("weak_signals") or [])) or "-", 110),
+        )
+    console.print(table)
+
+
+def _render_web_fingerprints(results: Dict[str, Any]) -> None:
+    rows = list((results.get("web_fingerprinting") or {}).get("results") or [])
+    if not rows:
+        return
+    table = Table(title="Web Fingerprinting / WAF Results", box=box.ROUNDED, header_style="bold cyan")
+    table.add_column("URL", style="white", overflow="fold")
+    table.add_column("Tool", style="cyan")
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Finding types", style="yellow", overflow="fold")
+    table.add_column("Observed output", style="bright_white", overflow="fold")
+    for row in rows[:16]:
+        findings = [f for f in (row.get("findings") or []) if isinstance(f, dict)]
+        ftypes = ", ".join(str(f.get("type")) for f in findings) or "-"
+        observed = " | ".join(_short(f.get("summary") or f, 100) for f in findings[:2])
+        if not observed:
+            observed = _short(row.get("stdout_excerpt") or row.get("error") or "-", 160)
+        table.add_row(
+            str(row.get("url") or ""),
+            str(row.get("tool") or ""),
+            f"[{_status_style(str(row.get('status')))}]{row.get('status')}[/]",
+            _short(ftypes, 90),
+            _short(observed, 180),
+        )
+    console.print(table)
+
+
+def _render_service_dns_screenshots(results: Dict[str, Any]) -> None:
+    service_rows = list((results.get("service_enumeration") or {}).get("results") or [])
     dns_rows = list((results.get("dns_record_enrichment") or {}).get("results") or [])
     screenshots = list((results.get("screenshot_triage") or {}).get("results") or [])
-    if not rows and not dns_rows and not screenshots:
+    if not service_rows and not dns_rows and not screenshots:
         return
-
-    table = Table(title="Service-Specific Enumeration and Triage", box=box.ROUNDED, header_style="bold cyan")
+    table = Table(title="Service Enumeration, DNS, and Screenshots", box=box.ROUNDED, header_style="bold cyan")
     table.add_column("Phase", style="bold cyan", no_wrap=True)
     table.add_column("Asset", style="white", overflow="fold")
-    table.add_column("Module", style="yellow")
-    table.add_column("Status", style="bold")
-    table.add_column("Result", style="bright_white", overflow="fold")
+    table.add_column("Tool / Module", style="yellow")
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Observed result", style="bright_white", overflow="fold")
 
-    for row in rows[:12]:
-        asset = f"{row.get('host')}:{row.get('port')}"
-        findings = row.get("findings") or []
-        result = ", ".join(str(f.get("type")) for f in findings if isinstance(f, dict)) or "completed/no flagged signal"
-        status = str(row.get("status") or "")
-        table.add_row("M8", asset, str(row.get("module") or ""), f"[{_status_style(status)}]{status}[/]", _short(result, 110))
+    for row in service_rows[:12]:
+        findings = [f for f in (row.get("findings") or []) if isinstance(f, dict)]
+        observed = ", ".join(str(f.get("type")) for f in findings) or _short(row.get("stdout_excerpt") or row.get("error") or "completed/no flagged signal", 160)
+        table.add_row("M8", f"{row.get('host')}:{row.get('port')}", str(row.get("module") or row.get("tool") or ""), f"[{_status_style(str(row.get('status')))}]{row.get('status')}[/]", _short(observed, 160))
 
     for row in dns_rows[:12]:
-        recs = row.get("records") or []
-        result = ", ".join(map(str, recs[:5])) if recs else "no records returned"
-        status = str(row.get("status") or "")
-        table.add_row("M10", str(row.get("target") or ""), f"DNS {row.get('record_type')}", f"[{_status_style(status)}]{status}[/]", _short(result, 110))
+        records = row.get("records") or []
+        observed = ", ".join(map(str, records[:8])) if records else (row.get("error") or "no records returned")
+        table.add_row("M10", str(row.get("target") or ""), f"DNS {row.get('record_type')}", f"[{_status_style(str(row.get('status')))}]{row.get('status')}[/]", _short(observed, 160))
 
     for row in screenshots[:8]:
-        result = row.get("screenshot_path") or row.get("error") or "not captured"
-        status = str(row.get("status") or "")
-        table.add_row("M11", str(row.get("url") or ""), str(row.get("tool") or "screenshot"), f"[{_status_style(status)}]{status}[/]", _short(result, 110))
+        observed = row.get("screenshot_path") or row.get("error") or "not captured"
+        table.add_row("M11", str(row.get("url") or ""), str(row.get("tool") or "screenshot"), f"[{_status_style(str(row.get('status')))}]{row.get('status')}[/]", _short(observed, 160))
     console.print(table)
 
 
-def _render_tool_coverage(results: Dict[str, Any]) -> None:
+def _render_tool_execution(results: Dict[str, Any]) -> None:
     trace = list(results.get("recon_phase_trace") or [])
     if not trace:
         return
-    table = Table(title="Tool Coverage and Provenance", box=box.SIMPLE_HEAD, header_style="bold cyan")
+    table = Table(title="Executed Tooling", box=box.SIMPLE_HEAD, header_style="bold cyan")
     table.add_column("Phase", style="bold cyan", no_wrap=True)
     table.add_column("Status", no_wrap=True)
-    table.add_column("Commands", justify="right", style="yellow")
-    table.add_column("Representative command", style="dim", overflow="fold")
+    table.add_column("#", justify="right", style="yellow")
+    table.add_column("Command sample", style="dim", overflow="fold")
     for row in trace:
         cmds = row.get("commands_executed") or []
         rep = "-"
@@ -241,5 +317,5 @@ def _render_tool_coverage(results: Dict[str, Any]) -> None:
             if len(cmds) > 1:
                 rep += f" (+{len(cmds)-1} more)"
         status = str(row.get("status") or "")
-        table.add_row(str(row.get("phase_id") or ""), f"[{_status_style(status)}]{status}[/]", str(len(cmds)), _short(rep, 130))
+        table.add_row(str(row.get("phase_id") or ""), f"[{_status_style(status)}]{status}[/]", str(len(cmds)), _short(rep, 150))
     console.print(table)
