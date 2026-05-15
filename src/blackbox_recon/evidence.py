@@ -20,6 +20,7 @@ ObservationType = Literal[
     "negative_result",
     "tool_error",
     "coverage_context",
+    "vulnerability_signal",
 ]
 
 Confidence = Literal["high", "medium", "low"]
@@ -48,6 +49,18 @@ def _http_like_port_row(p: Dict[str, Any]) -> bool:
     if "http" in svc or svc in ("https", "ssl/http", "http-proxy"):
         return True
     return False
+
+
+def _version_is_precise(version: Any) -> bool:
+    """True when a banner is version-specific enough to support CVE triage."""
+    if version is None:
+        return False
+    v = str(version).strip().lower()
+    if not v or v in ("unknown", "none", "null", "n/a"):
+        return False
+    # Product-only banners such as "nginx" are useful inventory but not precise
+    # enough for patch or CVE confidence.
+    return bool(re.search(r"\d", v))
 
 
 class EvidenceRecord(BaseModel):
@@ -101,6 +114,7 @@ def build_evidence_records(results: Dict[str, Any]) -> List[EvidenceRecord]:
                 observed_value={
                     "target_type": "bare_ip",
                     "dns_bruteforce_expected_yield": "low",
+                    "recommended_scope_input": "apex hostname or explicit hostname list when available",
                 },
                 confidence="high",
                 raw_ref="scan_context",
@@ -317,11 +331,13 @@ def build_deterministic_findings(evidence: List[EvidenceRecord], results: Dict[s
             )
         )
 
-    # Version fingerprint incomplete (nginx/http without version)
+    # Version fingerprint incomplete (HTTP-like services with product-only or missing version detail)
     for e in web_evidence:
         ver = (e.observed_value or {}).get("version")
         svc = str((e.observed_value or {}).get("service") or "").lower()
-        if ver in (None, "", "unknown") and ("http" in svc or "https" in svc or "nginx" in svc):
+        m = re.search(r":(\d+)/tcp", e.asset)
+        port = int(m.group(1)) if m else 0
+        if _http_like_port_row({"port": port, "service": svc}) and not _version_is_precise(ver):
             findings.append(
                 Finding(
                     id=_fid(),
@@ -333,7 +349,7 @@ def build_deterministic_findings(evidence: List[EvidenceRecord], results: Dict[s
                     evidence_ids=[e.id],
                     impact="CVE correlation and patch urgency are harder to establish without a precise product version.",
                     recommendation="Run an in-scope version probe (e.g. authenticated config review or allowed banner enrichment).",
-                    validation="Confirm whether a version string becomes available with additional safe probes.",
+                    validation="Confirm whether a precise version string becomes available with additional safe probes.",
                     confidence="high",
                 )
             )
@@ -437,13 +453,14 @@ def build_coverage_notes(results: Dict[str, Any], evidence: List[EvidenceRecord]
     tech_ct = len(results.get("technologies") or [])
     if tech_ct == 0:
         notes.append("No enriched technology profiles were stored (fingerprinting may be inconclusive or blocked).")
-    # nginx without version
     for e in evidence:
         if e.phase_id != "M3":
             continue
         v = (e.observed_value or {}).get("version")
         svc = str((e.observed_value or {}).get("service") or "").lower()
-        if v in (None, "", "unknown") and "http" in svc:
+        m = re.search(r":(\d+)/tcp", e.asset)
+        port = int(m.group(1)) if m else 0
+        if _http_like_port_row({"port": port, "service": svc}) and not _version_is_precise(v):
             notes.append("At least one HTTP-like service was detected without a precise version string in scan output.")
             break
     return notes
@@ -459,7 +476,7 @@ def build_evidence_package(
     target = str(results.get("target") or "")
     summary = results.get("summary") or {}
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "assessment": {
             "target": target,
             "mode": "lab" if lab_mode else "engaged",
