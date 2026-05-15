@@ -19,11 +19,84 @@ class AIConfig(BaseModel):
 
 class ReconConfig(BaseModel):
     """Reconnaissance configuration."""
+
     threads: int = Field(default=50, ge=1, le=200)
     timeout: int = Field(default=30, ge=1)
+    port_scan_timeout: int = Field(
+        default=6,
+        ge=1,
+        le=120,
+        description="Per-port TCP connect timeout (seconds) for tcp_connect port scan",
+    )
+    port_scan_mode: str = Field(
+        default="nmap_aggressive",
+        description="nmap_aggressive: nmap -v -p- -A --open per IP; tcp_connect: asyncio top-N scan",
+    )
+    nmap_aggressive_timeout_sec: int = Field(
+        default=7200,
+        ge=120,
+        le=86400,
+        description="Wall-clock budget per host for nmap -p- -A (default 2 hours)",
+    )
+    service_detection: str = Field(
+        default="auto",
+        description="none | banner | nmap | auto — used only for tcp_connect fallback scans",
+    )
+    nmap_executable: Optional[str] = Field(
+        default=None,
+        description="Path to nmap; default search PATH and common Windows install locations",
+    )
+    nmap_scan_timeout: int = Field(
+        default=300,
+        ge=30,
+        le=86400,
+        description="Wall-clock seconds budget for each host nmap -sV subprocess (fallback mode)",
+    )
+    service_probe_timeout: float = Field(
+        default=4.0,
+        ge=0.5,
+        le=60.0,
+        description="Seconds to wait for banner/HTTP data after connect during service probe",
+    )
+    run_nslookup: bool = Field(
+        default=True,
+        description="Run nslookup against each resolved IP and the raw target when portscan runs",
+    )
+    nslookup_timeout_sec: int = Field(default=120, ge=10, le=600)
+    directory_scan_enabled: bool = Field(
+        default=True,
+        description="Run gobuster or dirb against discovered http(s) URLs after port scan",
+    )
+    directory_tool: str = Field(
+        default="auto",
+        description="auto | gobuster | dirb | none",
+    )
+    directory_wordlist: Optional[str] = Field(
+        default=None,
+        description="Path to directory wordlist; unset uses BLACKBOX_RECON_DIR_WORDLIST or Kali paths under /usr/share/wordlists then bundled small list",
+    )
+    directory_threads: int = Field(default=10, ge=1, le=50)
+    directory_timeout_sec: int = Field(default=900, ge=60, le=7200)
+    directory_max_urls: int = Field(default=6, ge=1, le=20)
     wordlist: Optional[str] = Field(default=None, description="Path to subdomain wordlist")
-    ports: str = Field(default="top1000", description="Ports to scan: top100, top1000, all, or custom")
+    ports: str = Field(default="top1000", description="Ports for tcp_connect mode: top100, top1000, all, or custom")
     rate_limit: float = Field(default=0.0, ge=0.0, description="Requests per second limit")
+    kali_report_missing_tools: bool = Field(
+        default=True,
+        description="On Kali Linux, print apt hints when external CLIs required by config are missing",
+    )
+    kali_auto_install_missing: bool = Field(
+        default=False,
+        description="On Kali/Debian-like hosts, run non-interactive apt to install missing packages (needs sudo -n)",
+    )
+    kali_apt_update_before_install: bool = Field(
+        default=False,
+        description="Run apt-get update before auto-install (slower, fresher indexes)",
+    )
+    recon_verbose_phases: bool = Field(
+        default=True,
+        description="Print PTES-style phase banners and log each external command line to stdout",
+    )
 
 
 class Config(BaseModel):
@@ -96,10 +169,34 @@ ai:
 recon:
   threads: 50
   timeout: 30
+  # Default: full TCP nmap with OS/service/scripts (-A). Very thorough; long runtime per host.
+  port_scan_mode: nmap_aggressive  # nmap_aggressive | tcp_connect
+  nmap_aggressive_timeout_sec: 7200
+  # TCP connect scan tuning (only if port_scan_mode: tcp_connect)
+  port_scan_timeout: 6
+  service_detection: auto
+  # nmap_executable: "C:\\Program Files (x86)\\Nmap\\nmap.exe"
+  nmap_scan_timeout: 300
+  service_probe_timeout: 4.0
+  run_nslookup: true
+  nslookup_timeout_sec: 120
+  directory_scan_enabled: true
+  directory_tool: auto   # auto | gobuster | dirb | none
+  # directory_wordlist: /usr/share/wordlists/dirb/common.txt
+  # Or: export BLACKBOX_RECON_DIR_WORDLIST=/usr/share/seclists/Discovery/Web-Content/common.txt
+  directory_threads: 10
+  directory_timeout_sec: 900
+  directory_max_urls: 6
   # Path to subdomain wordlist (optional)
   # wordlist: /usr/share/wordlists/amass/bitquark_subdomains_top100K.txt
-  ports: top1000  # top100, top1000, all, or "80,443,8080"
+  ports: top1000  # top100, top1000, all, or "80,443,8080" (tcp_connect only)
   rate_limit: 0  # Requests per second (0 = no limit)
+  # Kali / Debian host integration (external CLIs: nmap, nslookup, gobuster/dirb)
+  kali_report_missing_tools: true
+  kali_auto_install_missing: false   # if true, requires passwordless sudo (sudo -n)
+  kali_apt_update_before_install: false
+  # Echo PTES-style phase banners and each subprocess command (nmap, nslookup, gobuster, …)
+  recon_verbose_phases: true
 
 # Modules to enable
 modules:

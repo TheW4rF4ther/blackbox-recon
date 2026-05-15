@@ -17,6 +17,7 @@ setup(
     url="https://github.com/blackboxintel/blackbox-recon",
     package_dir={"": "src"},
     packages=find_packages(where="src"),
+    package_data={"blackbox_recon": ["data/*.txt"]},
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Information Technology",

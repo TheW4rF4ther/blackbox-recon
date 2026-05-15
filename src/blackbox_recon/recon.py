@@ -1,15 +1,34 @@
 """Core reconnaissance engine."""
 
 import asyncio
-import json
 import socket
-import subprocess
+from datetime import datetime
+from functools import partial
 from typing import Dict, List, Any, Optional, Set
 from dataclasses import dataclass, asdict
-from urllib.parse import urlparse
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
+
+# Technology probes intentionally skip TLS verification (self-signed / lab targets).
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+from .nmap_top1000_tcp import NMAP_TOP1000_TCP
+from .service_detection import (
+    find_nmap_executable,
+    probe_tcp_service,
+    run_nmap_service_scan,
+    run_nmap_aggressive_scan,
+    parse_nmap_xml_open_tcp_ports,
+)
+from .dns_intel import run_nslookup
+from .dir_scan import run_directory_scan, resolve_directory_wordlist
+from .reporting import dumps_pretty, build_executive_snapshot, utc_now_iso
+from .engagement import EngagementRuntime, scope_allows_host
+from .kali_platform import ensure_kali_toolchain
+from .methodology import build_methodology_block
+from .execution_trace import PhaseTracer, print_execution_recap
 
 
 @dataclass
@@ -25,11 +44,14 @@ class SubdomainResult:
 @dataclass
 class PortScanResult:
     """Port scan result."""
+
     host: str
     port: int
     state: str  # open, closed, filtered
     service: Optional[str] = None
     version: Optional[str] = None
+    banner: Optional[str] = None  # truncated raw probe or script excerpt
+    scripts: Optional[List[str]] = None  # nmap script output lines (aggressive scan)
 
 
 @dataclass
@@ -130,82 +152,153 @@ class SubdomainEnumerator:
 
 
 class PortScanner:
-    """Port scanning module."""
-    
-    TOP_PORTS = [
-        80, 443, 21, 22, 25, 53, 110, 143, 3306, 3389, 445, 139, 8080, 8443,
-        23, 81, 88, 111, 135, 161, 389, 443, 445, 500, 514, 593, 636, 993,
-        995, 1080, 1433, 1521, 2049, 3128, 3306, 3389, 5432, 5900, 5901, 5985,
-        6379, 7001, 8000, 8080, 8443, 8888, 9000, 9090, 9200, 10000
-    ]
-    
+    """TCP connect port scan (Python asyncio). ``top1000`` uses Nmap's nmap-services frequency ordering."""
+
     SERVICE_NAMES = {
         21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns",
         80: "http", 110: "pop3", 111: "rpcbind", 135: "msrpc",
         139: "netbios-ssn", 143: "imap", 443: "https", 445: "microsoft-ds",
         993: "imaps", 995: "pop3s", 1723: "pptp", 3306: "mysql",
         3389: "ms-wbt-server", 5432: "postgresql", 5900: "vnc",
-        5901: "vnc-1", 6379: "redis", 8080: "http-proxy", 8443: "https-alt"
+        5901: "vnc-1", 6379: "redis", 8080: "http-proxy", 8443: "https-alt",
     }
-    
-    def __init__(self, ports: str = "top1000", timeout: int = 3):
+
+    def __init__(
+        self,
+        ports: str = "top1000",
+        timeout: int = 6,
+        service_detection: str = "auto",
+        nmap_executable: Optional[str] = None,
+        nmap_timeout_sec: int = 300,
+        service_probe_timeout: float = 4.0,
+    ):
         self.timeout = timeout
-        
+        self.service_detection = (service_detection or "auto").strip().lower()
+        if self.service_detection not in ("none", "banner", "nmap", "auto"):
+            self.service_detection = "auto"
+        self.nmap_executable = nmap_executable
+        self.nmap_timeout_sec = int(nmap_timeout_sec)
+        self.service_probe_timeout = float(service_probe_timeout)
+        nmap_full = list(NMAP_TOP1000_TCP)
+
         if ports == "top100":
-            self.ports = self.TOP_PORTS[:100]
+            self.ports = nmap_full[:100]
         elif ports == "top1000":
-            self.ports = self.TOP_PORTS
+            self.ports = nmap_full
         elif ports == "all":
             self.ports = list(range(1, 65536))
         else:
-            # Custom ports
-            self.ports = [int(p.strip()) for p in ports.split(",")]
-    
+            self.ports = sorted({int(p.strip()) for p in ports.split(",") if p.strip()})
+
+    def _service_name(self, port: int) -> str:
+        if port in self.SERVICE_NAMES:
+            return self.SERVICE_NAMES[port]
+        try:
+            return socket.getservbyport(port, "tcp")
+        except OSError:
+            return "unknown"
+
     async def scan(self, host: str) -> List[PortScanResult]:
         """Scan ports on a host."""
         print(f"[+] Scanning {len(self.ports)} ports on {host}...")
-        
-        open_ports = []
-        
-        semaphore = asyncio.Semaphore(100)
-        
-        async def bounded_scan(port):
+
+        # Limit parallel handshakes so cloud/WAF rate limits are less likely to drop valid opens.
+        workers = 64 if len(self.ports) > 64 else max(8, min(len(self.ports), 32))
+        semaphore = asyncio.Semaphore(workers)
+
+        async def bounded_scan(port: int) -> Optional[PortScanResult]:
             async with semaphore:
                 return await self._check_port(host, port)
-        
+
         tasks = [bounded_scan(port) for port in self.ports]
         results = await asyncio.gather(*tasks)
-        
+
         open_ports = [r for r in results if r is not None and r.state == "open"]
         print(f"[+] Found {len(open_ports)} open ports on {host}")
-        
+        await self._enrich_port_services(host, open_ports)
+
         return open_ports
-    
+
+    async def _enrich_port_services(self, host: str, open_ports: List[PortScanResult]) -> None:
+        """Populate service names / versions via banner probe and optional ``nmap -sV``."""
+        if self.service_detection == "none" or not open_ports:
+            return
+
+        if self.service_detection in ("banner", "auto"):
+            print(f"[+] Probing services (banner / HTTP) on {len(open_ports)} open port(s) for {host}...")
+            sem = asyncio.Semaphore(16)
+
+            async def _probe_one(p: PortScanResult) -> None:
+                async with sem:
+                    svc, ver, ban = await probe_tcp_service(
+                        host, p.port, float(self.timeout), self.service_probe_timeout
+                    )
+                    if svc:
+                        p.service = svc
+                    if ver:
+                        p.version = ver
+                    if ban:
+                        p.banner = ban
+
+            await asyncio.gather(*[_probe_one(p) for p in open_ports])
+
+        if self.service_detection in ("nmap", "auto"):
+            exe = find_nmap_executable(self.nmap_executable)
+            if exe:
+                print(f"[+] Running nmap -sV on {host} (open ports only; may take several minutes)...")
+                loop = asyncio.get_running_loop()
+
+                def _nmap() -> bool:
+                    return run_nmap_service_scan(host, open_ports, exe, self.nmap_timeout_sec)
+
+                ok = await loop.run_in_executor(None, _nmap)
+                if not ok and self.service_detection == "nmap":
+                    print(f"[!] nmap service scan failed or returned no parseable XML for {host}")
+                elif not ok:
+                    print(f"[!] nmap service scan skipped or failed for {host}; using banner data if any")
+            elif self.service_detection == "nmap":
+                print(
+                    "[!] nmap not found. Install Nmap or set recon.nmap_executable in config; "
+                    "falling back to banner-only for this run."
+                )
+
     async def _check_port(self, host: str, port: int) -> Optional[PortScanResult]:
-        """Check if a port is open."""
+        """TCP connect probe; treats successful handshake as open."""
+        writer: Optional[asyncio.StreamWriter] = None
         try:
-            loop = asyncio.get_event_loop()
-            
-            # Create connection
-            future = asyncio.open_connection(host, port)
-            reader, writer = await asyncio.wait_for(future, timeout=self.timeout)
-            
-            writer.close()
-            await writer.wait_closed()
-            
-            service = self.SERVICE_NAMES.get(port, "unknown")
-            
-            return PortScanResult(
-                host=host,
-                port=port,
-                state="open",
-                service=service,
-                version=None
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=self.timeout,
             )
         except asyncio.TimeoutError:
-            return PortScanResult(host=host, port=port, state="filtered", service=None, version=None)
-        except:
+            return PortScanResult(
+                host=host, port=port, state="filtered", service=None, version=None
+            )
+        except (ConnectionRefusedError, ConnectionResetError, OSError):
             return None
+        except Exception:
+            return None
+
+        service = self._service_name(port)
+        result = PortScanResult(
+            host=host,
+            port=port,
+            state="open",
+            service=service,
+            version=None,
+        )
+
+        if writer is not None:
+            try:
+                writer.close()
+                try:
+                    await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        return result
 
 
 class TechnologyDetector:
@@ -265,102 +358,493 @@ class TechnologyDetector:
                 headers=dict(response.headers),
                 interesting_headers=interesting
             )
-        except Exception as e:
+        except Exception:
             return None
+
+
+_WEBISH_PORTS = frozenset(
+    {
+        80,
+        81,
+        443,
+        591,
+        800,
+        8008,
+        8080,
+        8081,
+        8088,
+        8180,
+        8888,
+        8443,
+        9443,
+        8000,
+        3000,
+        5000,
+        8880,
+    }
+)
+
+
+def web_urls_from_port_rows(ports: List[Dict[str, Any]]) -> List[str]:
+    """Derive http(s) base URLs from open ports suitable for directory bruteforce."""
+    seen: Set[str] = set()
+    out: List[str] = []
+    for row in ports:
+        if not isinstance(row, dict) or row.get("state") != "open":
+            continue
+        host = row.get("host")
+        port = row.get("port")
+        if not host or not port:
+            continue
+        svc = (row.get("service") or "").lower()
+        if port not in _WEBISH_PORTS and "http" not in svc:
+            continue
+        use_tls = port in (443, 8443, 9443, 8883) or "https" in svc or "ssl/http" in svc
+        scheme = "https" if use_tls else "http"
+        if (scheme == "https" and port == 443) or (scheme == "http" and port == 80):
+            netloc = str(host)
+        else:
+            netloc = f"{host}:{port}"
+        u = f"{scheme}://{netloc}/"
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
 
 class ReconEngine:
     """Main reconnaissance engine."""
-    
-    def __init__(self, config: Dict[str, Any]):
+
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        engagement_runtime: Optional[EngagementRuntime] = None,
+    ):
         self.config = config
+        self._rt = engagement_runtime
         self.subdomain_enumerator = SubdomainEnumerator(
             threads=config.get("threads", 50),
-            wordlist=config.get("wordlist")
+            wordlist=config.get("wordlist"),
         )
         self.port_scanner = PortScanner(
             ports=config.get("ports", "top1000"),
-            timeout=config.get("timeout", 3)
+            timeout=int(config.get("port_scan_timeout", config.get("timeout", 6))),
+            service_detection=str(config.get("service_detection", "auto")),
+            nmap_executable=config.get("nmap_executable"),
+            nmap_timeout_sec=int(config.get("nmap_scan_timeout", 300)),
+            service_probe_timeout=float(config.get("service_probe_timeout", 4.0)),
         )
         self.tech_detector = TechnologyDetector()
+        self.results: Dict[str, Any] = {}
+
+    def _gather_ipv4s(self, target: str) -> Set[str]:
+        """Collect IPv4 addresses for the apex, enumerated subdomains, and direct resolution."""
+        ips: Set[str] = set()
+        for sub in self.results.get("subdomains", []):
+            ips.update(sub.get("ip_addresses", []))
+
+        def _add_ipv4_for_host(hostname: str) -> None:
+            try:
+                infos = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
+            except OSError:
+                return
+            for inf in infos:
+                ip = inf[4][0]
+                if ip:
+                    ips.add(ip)
+
+        _add_ipv4_for_host(target)
+        for sub in self.results.get("subdomains", []):
+            fqdn = sub.get("subdomain")
+            if fqdn:
+                _add_ipv4_for_host(fqdn)
+
+        if not ips:
+            try:
+                ips.add(socket.gethostbyname(target))
+            except OSError:
+                pass
+        if self._rt is not None:
+            ips = {ip for ip in ips if self._host_allowed_for_active_scan(ip)}
+        return ips
+
+    def _host_allowed_for_active_scan(self, host: str) -> bool:
+        """Enforce engagement allowed_targets for any host or IP we would actively touch."""
+        if self._rt is None:
+            return True
+        h = host.strip().lower()
+        if h in self._rt.scope_expanded_ips:
+            return True
+        ok, _ = scope_allows_host(h, self._rt.spec)
+        return ok
+
+    @staticmethod
+    def _host_from_http_url(url: str) -> str:
+        u = url.replace("http://", "").replace("https://", "")
+        return u.split("/")[0].split(":")[0].strip().lower()
+
+    async def run(self, target: str, modules: List[str]) -> Dict[str, Any]:
+        """Run reconnaissance with specified modules."""
+        started = utc_now_iso()
         self.results = {
-            "target": None,
-            "timestamp": None,
+            "schema_version": "2.2",
+            "report_title": "Blackbox Recon — structured engagement findings",
+            "target": target,
+            "timestamp": datetime.now().isoformat(),
+            "recon_started_utc": started,
+            "recon_completed_utc": None,
+            "engagement": {
+                "target": target,
+                "modules_requested": list(modules),
+                "recon_started_utc": started,
+                "port_scan_mode": str(self.config.get("port_scan_mode", "nmap_aggressive")).lower(),
+            },
+            "executive_snapshot": {},
+            "dns_intelligence": {"nslookups": []},
+            "nmap_scan": {"mode": None, "per_host": []},
             "subdomains": [],
             "ports": [],
             "technologies": [],
-            "summary": {}
+            "web_content_discovery": {"directory_scans": [], "urls_targeted": []},
+            "recon_phase_trace": [],
+            "summary": {},
         }
-    
-    async def run(self, target: str, modules: List[str]) -> Dict[str, Any]:
-        """Run reconnaissance with specified modules."""
-        from datetime import datetime
-        
-        self.results["target"] = target
-        self.results["timestamp"] = datetime.now().isoformat()
-        
+
+        if self._rt is not None:
+            self.results["engagement"]["record"] = self._rt.spec.model_dump()
+            self.results["engagement"]["workspace_root"] = str(self._rt.paths["root"])
+            self.results["engagement"]["methodology"] = {
+                "execution_gates": "authorization, in_scope_asset, allowed_technique, action_reason",
+                "enforced_at": "cli_before_subprocess",
+            }
+            self.results["engagement"]["scope_note"] = (
+                "Subdomain enumeration may list assets beyond explicit allowed_targets; "
+                "active scans (nmap, nslookup, gobuster, HTTP probes) are filtered to in-scope hosts only."
+            )
+            self._rt.audit("recon_engine_start", target=target, modules=list(modules))
+
+        snap, install_err = ensure_kali_toolchain(
+            self.config,
+            auto_install=bool(self.config.get("kali_auto_install_missing", False)),
+            apt_update_first=bool(self.config.get("kali_apt_update_before_install", False)),
+        )
+        self.results["platform_toolchain"] = snap
+        self.results["recon_methodology"] = build_methodology_block(modules, self.config, snap)
+        if install_err:
+            print(f"[!] Kali toolchain auto-install: {install_err}")
+        if (
+            snap.get("is_kali")
+            and (snap.get("missing_apt_packages") or [])
+            and bool(self.config.get("kali_report_missing_tools", True))
+            and not bool(self.config.get("kali_auto_install_missing", False))
+        ):
+            pkgs = " ".join(snap["missing_apt_packages"])
+            print(
+                f"[!] Kali tool gaps for current config — install:\n"
+                f"    sudo apt-get install -y {pkgs}\n"
+                f"    Or: blackbox-recon kali-setup --install  (passwordless sudo required)"
+            )
+
         print(f"\n[+] Starting reconnaissance on {target}")
         print("=" * 50)
-        
-        tasks = []
-        
+        echo_phases = bool(self.config.get("recon_verbose_phases", True))
+        tr = PhaseTracer(self.results, echo=echo_phases)
+
         if "subdomain" in modules:
+            tr.start(
+                "M1",
+                [
+                    "Stack: Python 3 — asyncio + socket.gethostbyname_ex + requests (HTTP probe where DNS resolves)",
+                    f"Wordlist: built-in {len(SubdomainEnumerator.COMMON_SUBDOMAINS)} common sub-labels against `{target}`",
+                ],
+            )
+            tr.note_command(
+                "method",
+                f"DNS brute: enumerate `{len(SubdomainEnumerator.COMMON_SUBDOMAINS)}` labels → gethostbyname_ex; "
+                f"optional GET http://<fqdn>/ (timeout=5)",
+            )
             subdomains = await self.subdomain_enumerator.enumerate(target)
             self.results["subdomains"] = [asdict(s) for s in subdomains]
-        
+            tr.note_command(
+                "python_http_probe",
+                "requests.get(http://<subdomain>/) for resolved hosts (same phase as DNS checks)",
+                hosts_with_http_status=sum(1 for s in subdomains if s.status_code is not None),
+            )
+            tr.finish(
+                "completed",
+                f"{len(subdomains)} subdomain(s) with A records; "
+                f"{sum(1 for s in subdomains if s.status_code is not None)} returned HTTP status",
+            )
+        else:
+            tr.skip("M1", "subdomain module not in --modules")
+
+        ips = self._gather_ipv4s(target)
+
+        if bool(self.config.get("run_nslookup", True)):
+            tr.start(
+                "M2",
+                [
+                    "Stack: host `nslookup` binary (subprocess) — PTR / forward DNS intelligence",
+                    f"Targets: {len(ips)} IPv4 address(es) plus apex string `{target}`",
+                ],
+            )
+            print(f"[+] Running nslookup (PTR / forward hints) for {len(ips)} IP(s) + target string...")
+            loop = asyncio.get_running_loop()
+            lookups: List[Dict[str, Any]] = []
+            for ip in sorted(ips):
+                ns = await loop.run_in_executor(
+                    None,
+                    partial(
+                        run_nslookup,
+                        ip,
+                        int(self.config.get("nslookup_timeout_sec", 120)),
+                    ),
+                )
+                lookups.append(ns)
+                cmd = ns.get("command") or f"nslookup {ip}"
+                tr.note_command("nslookup", cmd, target=ip, exit_code=ns.get("exit_code"))
+            ns_target = await loop.run_in_executor(
+                None,
+                partial(
+                    run_nslookup,
+                    target,
+                    int(self.config.get("nslookup_timeout_sec", 120)),
+                ),
+            )
+            lookups.append(ns_target)
+            cmdt = ns_target.get("command") or f"nslookup {target}"
+            tr.note_command("nslookup", cmdt, target=target, exit_code=ns_target.get("exit_code"))
+            self.results["dns_intelligence"]["nslookups"] = lookups
+            tr.finish("completed", f"{len(lookups)} nslookup run(s) recorded")
+        else:
+            tr.skip("M2", "recon.run_nslookup is false in config")
+
+        if "portscan" not in modules:
+            tr.skip("M3", "portscan module not in --modules")
+            tr.skip("M4", "web content discovery runs after port scan (portscan not selected)")
+
         if "portscan" in modules:
-            # Get unique IPs from subdomains or use target
-            ips = set()
-            for sub in self.results["subdomains"]:
-                ips.update(sub.get("ip_addresses", []))
-            
-            if not ips:
-                try:
-                    ip = socket.gethostbyname(target)
-                    ips.add(ip)
-                except:
-                    pass
-            
-            all_ports = []
-            for ip in ips:
-                ports = await self.port_scanner.scan(ip)
-                all_ports.extend(ports)
-            
-            self.results["ports"] = [asdict(p) for p in all_ports]
-        
+            mode = str(self.config.get("port_scan_mode", "nmap_aggressive")).strip().lower()
+            self.results["nmap_scan"]["mode"] = mode
+            exe = find_nmap_executable(self.config.get("nmap_executable"))
+            scan_hosts = sorted(ips) if ips else ([target] if target else [])
+
+            tr.start(
+                "M3",
+                [
+                    f"Configured port_scan_mode: `{mode}`",
+                    f"Targets: {len(scan_hosts)} host(s) — {', '.join(scan_hosts[:12])}{' …' if len(scan_hosts) > 12 else ''}",
+                    f"Service enrichment: service_detection={self.config.get('service_detection', 'auto')} "
+                    f"(may invoke nmap -sV from PortScanner on tcp_connect path)",
+                ],
+            )
+
+            if mode == "nmap_aggressive" and exe:
+                budget = int(self.config.get("nmap_aggressive_timeout_sec", self.config.get("nmap_scan_timeout", 7200)))
+                tr.note_command("nmap_binary", exe)
+                tr.note_command(
+                    "nmap_profile",
+                    f"Per host: nmap -v -p- -A --open -T4 (full TCP + scripts/OS/service); budget {budget}s",
+                )
+                print(
+                    f"[+] Default port scan: nmap -v -p- -A --open (per host; budget {budget}s each). "
+                    "This is thorough and may take a long time."
+                )
+                loop = asyncio.get_running_loop()
+                all_ports: List[PortScanResult] = []
+                for ip in scan_hosts:
+                    print(f"[+] nmap aggressive scan → {ip}")
+                    if self._rt is not None:
+                        self._rt.audit("nmap_aggressive_start", host=ip)
+                    ok, xml_out, err, cmd = await loop.run_in_executor(
+                        None, partial(run_nmap_aggressive_scan, ip, exe, budget)
+                    )
+                    tr.note_command("nmap_aggressive", cmd, host=ip, xml_parseable=bool(ok and ("<nmaprun" in (xml_out or "")[:8000])))
+                    rows = parse_nmap_xml_open_tcp_ports(xml_out)
+                    if not rows and ok:
+                        print(f"[!] nmap returned no open TCP ports in XML for {ip}")
+                    for r in rows:
+                        all_ports.append(
+                            PortScanResult(
+                                host=r["host"],
+                                port=r["port"],
+                                state=r["state"],
+                                service=r.get("service"),
+                                version=r.get("version"),
+                                banner=r.get("banner"),
+                                scripts=r.get("scripts"),
+                            )
+                        )
+                    self.results["nmap_scan"]["per_host"].append(
+                        {
+                            "host": ip,
+                            "command": cmd,
+                            "xml_parseable": ok and ("<nmaprun" in (xml_out or "")[:8000]),
+                            "open_ports_in_xml": len(rows),
+                            "stderr_tail": (err or "")[-8000:],
+                        }
+                    )
+                self.results["ports"] = [asdict(p) for p in all_ports]
+            else:
+                if mode == "nmap_aggressive" and not exe:
+                    print(
+                        "[!] port_scan_mode=nmap_aggressive but nmap not found; "
+                        "falling back to async TCP connect scan. Install Nmap or set nmap_executable."
+                    )
+                    self.results["nmap_scan"]["mode"] = "tcp_connect_fallback"
+                else:
+                    self.results["nmap_scan"]["mode"] = "tcp_connect"
+                n_ports = len(self.port_scanner.ports)
+                tr.note_command(
+                    "tcp_connect_engine",
+                    f"Python asyncio.open_connection per port — {n_ports} TCP ports × {len(scan_hosts)} host(s)",
+                )
+                all_ports: List[PortScanResult] = []
+                for ip in scan_hosts:
+                    tr.note_command("tcp_connect_batch", f"asyncio full handshake scan → {ip} (ports={n_ports})")
+                    ports = await self.port_scanner.scan(ip)
+                    all_ports.extend(ports)
+                self.results["ports"] = [asdict(p) for p in all_ports]
+
+            open_ct = sum(1 for p in self.results["ports"] if p.get("state") == "open")
+            tr.finish(
+                "completed",
+                f"{len(self.results['ports'])} port row(s) stored ({open_ct} open) across {len(scan_hosts)} host(s)",
+            )
+
+            wl_path = self.config.get("directory_wordlist")
+            wordlist = str(resolve_directory_wordlist(str(wl_path) if wl_path else None))
+
+            dir_enabled = bool(self.config.get("directory_scan_enabled", True))
+            d_tool = str(self.config.get("directory_tool", "auto")).lower()
+            if dir_enabled and d_tool != "none":
+                tr.start(
+                    "M4",
+                    [
+                        "Stack: gobuster or dirb (external subprocess) + on-disk wordlist",
+                        f"Wordlist path: {wordlist}",
+                        f"Tool preference: directory_tool={d_tool}",
+                    ],
+                )
+                urls = web_urls_from_port_rows(self.results["ports"])
+                if self._rt is not None:
+                    urls = [u for u in urls if self._host_allowed_for_active_scan(self._host_from_http_url(u))]
+                max_urls = int(self.config.get("directory_max_urls", 6))
+                urls = urls[:max_urls]
+                self.results["web_content_discovery"]["urls_targeted"] = urls
+                if not urls:
+                    tr.finish(
+                        "completed",
+                        "No HTTP(S) base URLs derived from open ports (or none in-scope); directory tools not launched",
+                    )
+                else:
+                    print(f"[+] Web content discovery on {len(urls)} URL(s) (gobuster/dirb)...")
+                    loop = asyncio.get_running_loop()
+                    d_timeout = int(self.config.get("directory_timeout_sec", 900))
+                    d_threads = int(self.config.get("directory_threads", 10))
+                    scans: List[Dict[str, Any]] = []
+                    for url in urls:
+                        if self._rt is not None:
+                            self._rt.audit(
+                                "directory_bruteforce_start",
+                                url=url,
+                                tool=str(self.config.get("directory_tool", "auto")),
+                            )
+                        rep = await loop.run_in_executor(
+                            None,
+                            partial(
+                                run_directory_scan,
+                                url,
+                                wordlist,
+                                tool=d_tool,
+                                threads=d_threads,
+                                timeout_sec=d_timeout,
+                            ),
+                        )
+                        scans.append(rep)
+                        tlab = rep.get("tool") or "directory_scan"
+                        cmd = rep.get("command") or "(no command — skipped or failed)"
+                        tr.note_command(tlab, cmd, base_url=rep.get("base_url"), status=rep.get("status"))
+                    self.results["web_content_discovery"]["directory_scans"] = scans
+                    hits = sum(len(s.get("findings_interesting") or []) for s in scans)
+                    tr.finish(
+                        "completed",
+                        f"{len(scans)} bruteforce run(s); {hits} interesting path(s) (see web_content_discovery)",
+                    )
+            elif not dir_enabled:
+                tr.skip("M4", "directory_scan_enabled is false")
+            else:
+                tr.skip("M4", "directory_tool is none")
+
         if "technology" in modules:
+            tr.start(
+                "M5",
+                [
+                    "Stack: Python requests + BeautifulSoup heuristics (header/HTML tech fingerprinting)",
+                    "TLS verify disabled for opportunistic fingerprinting (lab / authorized testing only)",
+                ],
+            )
             urls_to_check = [f"http://{target}", f"https://{target}"]
-            for sub in self.results["subdomains"][:10]:  # Limit to first 10
+            for sub in self.results["subdomains"][:10]:
                 urls_to_check.append(f"http://{sub['subdomain']}")
-            
+
             tech_results = []
             for url in urls_to_check:
+                host = self._host_from_http_url(url + "/")
+                if self._rt is not None and not self._host_allowed_for_active_scan(host):
+                    continue
+                tr.note_command(
+                    "requests_fingerprint",
+                    f"GET {url} timeout=10 verify=False allow_redirects=True",
+                )
                 result = await self.tech_detector.detect(url)
                 if result:
                     tech_results.append(asdict(result))
-            
+
             self.results["technologies"] = tech_results
-        
-        # Generate summary
+            tr.finish(
+                "completed",
+                f"{len(tech_results)} technology profile(s) stored (see technologies[] in JSON)",
+            )
+        else:
+            tr.skip("M5", "technology module not in --modules")
+
+        dir_scans = (self.results.get("web_content_discovery") or {}).get("directory_scans") or []
+        interesting_hits = sum(len(s.get("findings_interesting") or []) for s in dir_scans)
+
         self.results["summary"] = {
             "total_subdomains": len(self.results["subdomains"]),
             "total_open_ports": len(self.results["ports"]),
             "total_tech_detected": len(self.results["technologies"]),
-            "web_services": len([s for s in self.results["subdomains"] if s.get("status_code")])
+            "web_services": len([s for s in self.results["subdomains"] if s.get("status_code")]),
+            "nslookup_runs": len((self.results.get("dns_intelligence") or {}).get("nslookups") or []),
+            "web_urls_targeted": len((self.results.get("web_content_discovery") or {}).get("urls_targeted") or []),
+            "directory_scan_runs": len(dir_scans),
+            "directory_interesting_hits": interesting_hits,
         }
-        
+
+        self.results["recon_completed_utc"] = utc_now_iso()
+        self.results["executive_snapshot"] = build_executive_snapshot(self.results)
+
+        if self._rt is not None:
+            self._rt.audit(
+                "recon_engine_complete",
+                target=target,
+                open_ports=len(self.results.get("ports") or []),
+            )
         print("\n[+] Reconnaissance complete")
         print(f"    Subdomains: {self.results['summary']['total_subdomains']}")
         print(f"    Open Ports: {self.results['summary']['total_open_ports']}")
         print(f"    Web Services: {self.results['summary']['web_services']}")
-        
+        print(f"    DNS lookups: {self.results['summary']['nslookup_runs']}")
+        print(f"    Directory scans: {self.results['summary']['directory_scan_runs']}")
+        print_execution_recap(self.results, echo=echo_phases)
+
         return self.results
-    
+
     def save_results(self, output_file: str, format: str = "json"):
         """Save results to file."""
         if format == "json":
-            with open(output_file, 'w') as f:
-                json.dump(self.results, f, indent=2)
-        # Add other formats as needed
-        
+            with open(output_file, "w", encoding="utf-8") as handle:
+                handle.write(dumps_pretty(self.results))
         print(f"[+] Results saved to: {output_file}")

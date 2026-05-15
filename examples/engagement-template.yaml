@@ -1,0 +1,25 @@
+# Copy to your engagement folder and edit. Pass: blackbox-recon -t TARGET --engagement ./engagement.yaml
+#
+# Core rule: no execution without authorization, in-scope asset, allowed technique, and action_reason.
+
+engagement_id: "client-2026-001"
+client: "Example Client Ltd"
+authorization_reference: "SOW-2026-042 signed 2026-05-01 / ROE v3 accepted"
+sow_reference: "SOW-2026-042"
+rules_of_engagement_reference: "ROE-2026-042"
+# Optional calendar gate (omit both to skip date check):
+# testing_window_start: "2026-05-20"
+# testing_window_end: "2026-05-24"
+
+allowed_targets:
+  - "203.0.113.50" # replace with approved IP / CIDR / hostname
+excluded_targets: []
+
+# If non-empty, ONLY these technique ids run (see plan_techniques in engagement.py):
+# allowed_techniques: []
+
+prohibited_techniques: []
+# Example: ["directory_bruteforce"]
+
+action_reason: "External discovery — map approved public IP services for risk triage per ROE section 4."
+created_by: "analyst@example.com"

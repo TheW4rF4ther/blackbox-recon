@@ -3,6 +3,7 @@
 
 import asyncio
 import os
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -17,11 +18,22 @@ from rich import box
 
 from .config import Config, create_default_config
 from .recon import ReconEngine
+from .engagement import (
+    EngagementGateError,
+    assert_four_questions,
+    assert_within_testing_window,
+    build_engagement_runtime,
+    compute_standing_scope_ips,
+    load_engagement,
+    plan_techniques,
+)
 from .ai_analyzer import (
     AIAnalyzer,
     check_local_llm_connection,
     check_ollama_connection,
 )
+from .kali_platform import ensure_kali_toolchain
+from .methodology import build_methodology_block
 
 
 for stream in (sys.stdout, sys.stderr):
@@ -31,10 +43,18 @@ for stream in (sys.stdout, sys.stderr):
 console = Console()
 
 
-def resolve_report_path(output: Optional[str], target: str, output_format: str) -> Path:
+def resolve_report_path(
+    output: Optional[str],
+    target: str,
+    output_format: str,
+    workspace_reports: Optional[Path] = None,
+) -> Path:
     """Pick a writable path for reports (avoids PermissionError in protected cwd)."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     default_name = f"{target}-recon-{timestamp}.{output_format}"
+    if not output and workspace_reports is not None:
+        workspace_reports.mkdir(parents=True, exist_ok=True)
+        return workspace_reports / default_name
     if not output:
         path = Path.home() / ".blackbox-recon" / "reports" / default_name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -48,7 +68,7 @@ def resolve_report_path(output: Optional[str], target: str, output_format: str) 
 
 def write_report_file(path: Path, results: dict, output_format: str) -> Path:
     """Write report; on PermissionError fall back to ~/.blackbox-recon/reports/."""
-    import json
+    from .reporting import dumps_pretty
 
     def _write(p: Path) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -56,7 +76,7 @@ def write_report_file(path: Path, results: dict, output_format: str) -> Path:
             generate_markdown_report(results, str(p))
         else:
             with p.open("w", encoding="utf-8") as handle:
-                json.dump(results, handle, indent=2)
+                handle.write(dumps_pretty(results))
 
     try:
         _write(path)
@@ -104,10 +124,55 @@ def print_banner():
 )
 @click.option('--full', is_flag=True, help='Enable all modules')
 @click.option('--init-config', is_flag=True, help='Create default configuration file')
+@click.option(
+    '--install-missing-kali-tools',
+    is_flag=True,
+    help='On Kali/Debian-like hosts, try non-interactive apt install for missing CLIs (sudo -n)',
+)
+@click.option(
+    '--engagement',
+    'engagement_file',
+    type=click.Path(exists=True, dir_okay=False),
+    help='YAML/JSON engagement record (authorization, scope, ROE refs). Required unless --no-engagement-gates.',
+)
+@click.option(
+    '--no-engagement-gates',
+    is_flag=True,
+    help='Skip engagement file, methodology gates, and workspace (lab/CI only; not for client work).',
+)
+@click.option(
+    '--action-reason',
+    help='Override engagement action_reason for this run (client value statement).',
+)
+@click.option(
+    '--workspace-root',
+    type=str,
+    default=None,
+    help='Base for Aesa-style workspaces (default: ~/.blackbox-recon/workspaces).',
+)
 @click.option('--verbose', '-v', is_flag=True, help='Verbose output')
 @click.version_option(version='1.0.0', prog_name='blackbox-recon')
-def main(target, config, output, output_format, modules, ai_mode, ai_model,
-         local_url, ollama_url, ollama_model, skip_ai_precheck, full, init_config, verbose):
+def recon_main(
+    target,
+    config,
+    output,
+    output_format,
+    modules,
+    ai_mode,
+    ai_model,
+    local_url,
+    ollama_url,
+    ollama_model,
+    skip_ai_precheck,
+    full,
+    init_config,
+    install_missing_kali_tools,
+    engagement_file,
+    no_engagement_gates,
+    action_reason,
+    workspace_root,
+    verbose,
+):
     """Blackbox Recon - AI-Augmented Reconnaissance for Penetration Testers."""
     
     print_banner()
@@ -191,14 +256,98 @@ def main(target, config, output, output_format, modules, ai_mode, ai_model,
         recon_config = {
             "threads": cfg.recon.threads,
             "timeout": cfg.recon.timeout,
+            "port_scan_timeout": cfg.recon.port_scan_timeout,
+            "port_scan_mode": cfg.recon.port_scan_mode,
+            "nmap_aggressive_timeout_sec": cfg.recon.nmap_aggressive_timeout_sec,
+            "service_detection": cfg.recon.service_detection,
+            "nmap_executable": cfg.recon.nmap_executable,
+            "nmap_scan_timeout": cfg.recon.nmap_scan_timeout,
+            "service_probe_timeout": cfg.recon.service_probe_timeout,
             "wordlist": cfg.recon.wordlist,
-            "ports": cfg.recon.ports
+            "ports": cfg.recon.ports,
+            "run_nslookup": cfg.recon.run_nslookup,
+            "nslookup_timeout_sec": cfg.recon.nslookup_timeout_sec,
+            "directory_scan_enabled": cfg.recon.directory_scan_enabled,
+            "directory_tool": cfg.recon.directory_tool,
+            "directory_wordlist": cfg.recon.directory_wordlist,
+            "directory_threads": cfg.recon.directory_threads,
+            "directory_timeout_sec": cfg.recon.directory_timeout_sec,
+            "directory_max_urls": cfg.recon.directory_max_urls,
+            "kali_report_missing_tools": cfg.recon.kali_report_missing_tools,
+            "kali_auto_install_missing": cfg.recon.kali_auto_install_missing or install_missing_kali_tools,
+            "kali_apt_update_before_install": cfg.recon.kali_apt_update_before_install,
+            "recon_verbose_phases": cfg.recon.recon_verbose_phases,
         }
-        
-        engine = ReconEngine(recon_config)
+
+        engagement_rt = None
+        if not no_engagement_gates:
+            if not engagement_file:
+                console.print("[red][!] Engagement record required for execution.[/red]")
+                console.print(
+                    "[dim]Provide --engagement path/to/engagement.yaml (authorization, scope, action_reason) "
+                    "or pass --no-engagement-gates only for lab/CI.[/dim]"
+                )
+                sys.exit(1)
+            try:
+                spec = load_engagement(engagement_file)
+                if action_reason:
+                    spec = spec.model_copy(update={"action_reason": action_reason})
+                assert_within_testing_window(spec)
+                techniques = plan_techniques(modules_list, recon_config)
+                assert_four_questions(spec, target, techniques)
+                expanded = compute_standing_scope_ips(target, spec)
+                wb = Path(workspace_root).expanduser() if workspace_root else None
+                engagement_rt = build_engagement_runtime(spec, expanded, wb)
+                shutil.copy2(engagement_file, engagement_rt.paths["00_scope"] / Path(engagement_file).name)
+                engagement_rt.audit(
+                    "cli_execution_authorized",
+                    target=target,
+                    techniques=techniques,
+                    engagement_file=str(Path(engagement_file).resolve()),
+                )
+                console.print(
+                    f"[green][+][/green] Engagement gates passed — workspace: [cyan]{engagement_rt.paths['root']}[/cyan]"
+                )
+            except EngagementGateError as exc:
+                console.print(f"[red][!] Engagement gate: {exc}[/red]")
+                sys.exit(1)
+        else:
+            console.print(
+                "[yellow][!] --no-engagement-gates: no authorization/scope/workspace enforcement (lab only).[/yellow]"
+            )
+
+        engine = ReconEngine(recon_config, engagement_rt)
         
         console.print("[cyan][*] Running reconnaissance...[/cyan]")
         results = asyncio.run(engine.run(target, modules_list))
+
+        trace = results.get("recon_phase_trace") or []
+        if trace:
+            console.print("\n[bold cyan]Penetration-test recon — what actually ran[/bold cyan]")
+            et = Table(title="PTES phases (live execution)", box=box.ROUNDED)
+            et.add_column("Phase", style="cyan", no_wrap=True)
+            et.add_column("Status", style="magenta")
+            et.add_column("Commands", justify="right")
+            et.add_column("Sample tooling / command line", style="dim")
+            for row in trace:
+                cmds = row.get("commands_executed") or []
+                samp = ""
+                if cmds:
+                    first = cmds[0]
+                    samp = f"{first.get('label', '')}: {(first.get('command') or '')[:90]}"
+                    if len(cmds) > 1:
+                        samp += " …"
+                et.add_row(
+                    str(row.get("phase_id", "")),
+                    str(row.get("status", "")),
+                    str(len(cmds)),
+                    samp or "—",
+                )
+            console.print(et)
+            console.print(
+                "[dim]Full subprocess lines, timestamps, and PTES copy live under JSON key "
+                "`recon_phase_trace` (per-phase `commands_executed`).[/dim]"
+            )
         
         # AI Analysis
         if ai_mode != 'none':
@@ -235,7 +384,14 @@ def main(target, config, output, output_format, modules, ai_mode, ai_model,
                 # Display AI analysis
                 console.print("\n[bold yellow]AI Analysis Results[/bold yellow]")
                 console.print("=" * 60)
-                console.print(Panel(analysis.technical_analysis, title="Analysis", border_style="green"))
+                analysis_body = (analysis.technical_analysis or "").strip()
+                if not analysis_body:
+                    analysis_body = (
+                        "[dim]The model returned no visible analysis text. "
+                        "In LM Studio: raise max tokens, disable extended reasoning for this model, "
+                        "or use a non-thinking chat model. Raw JSON is still in the saved report.[/dim]"
+                    )
+                console.print(Panel(analysis_body, title="Analysis", border_style="green"))
                 
                 # Add analysis to results
                 results['ai_analysis'] = {
@@ -262,7 +418,8 @@ def main(target, config, output, output_format, modules, ai_mode, ai_model,
         console.print(table)
         
         # Save results
-        output_path = resolve_report_path(output, target, output_format)
+        ws_reports = engagement_rt.paths["reports"] if engagement_rt else None
+        output_path = resolve_report_path(output, target, output_format, workspace_reports=ws_reports)
         written_path = write_report_file(output_path, results, output_format)
         if written_path != output_path:
             console.print(
@@ -279,12 +436,17 @@ def main(target, config, output, output_format, modules, ai_mode, ai_model,
         
         if results.get('ports'):
             console.print("\n[bold yellow]Open Ports:[/bold yellow]")
-            ports_by_host = {}
-            for port in results['ports'][:10]:
-                host = port['host']
+            ports_by_host: dict = {}
+            for port in results["ports"][:10]:
+                host = port["host"]
                 if host not in ports_by_host:
                     ports_by_host[host] = []
-                ports_by_host[host].append(f"{port['port']}/{port['service']}")
+                ver = port.get("version") or ""
+                if ver:
+                    ver = f" ({ver[:60]}{'…' if len(ver) > 60 else ''})"
+                line = f"{port['port']}/{port.get('service', '?')}{ver}"
+                if line not in ports_by_host[host]:
+                    ports_by_host[host].append(line)
             
             for host, ports in list(ports_by_host.items())[:3]:
                 console.print(f"  - {host}: {', '.join(ports[:5])}")
@@ -302,41 +464,240 @@ def main(target, config, output, output_format, modules, ai_mode, ai_model,
         sys.exit(1)
 
 
+@click.command()
+@click.option(
+    "--config",
+    "-c",
+    type=click.Path(exists=True, dir_okay=False),
+    help="YAML config (uses recon.* to decide which tools are required)",
+)
+@click.option(
+    "--install",
+    is_flag=True,
+    help="Run apt-get install for missing packages (non-interactive sudo required)",
+)
+@click.option(
+    "--apt-update",
+    is_flag=True,
+    help="Run apt-get update before install (slower)",
+)
+def kali_setup_command(config: Optional[str], install: bool, apt_update: bool):
+    """Verify Kali/Debian external CLIs and optionally install missing apt packages."""
+    print_banner()
+    try:
+        if config:
+            cfg = Config.load_from_file(config)
+        else:
+            p = Config.get_default_path()
+            cfg = Config.load_from_file(str(p)) if p.exists() else Config()
+    except Exception as exc:
+        console.print(f"[yellow][!] Config load failed, using defaults: {exc}[/yellow]")
+        cfg = Config()
+
+    recon_cfg = {
+        "port_scan_mode": cfg.recon.port_scan_mode,
+        "run_nslookup": cfg.recon.run_nslookup,
+        "directory_scan_enabled": cfg.recon.directory_scan_enabled,
+        "directory_tool": cfg.recon.directory_tool,
+        "kali_auto_install_missing": install,
+        "kali_apt_update_before_install": apt_update,
+        "kali_report_missing_tools": cfg.recon.kali_report_missing_tools,
+    }
+    snap, err = ensure_kali_toolchain(
+        recon_cfg,
+        auto_install=install,
+        apt_update_first=apt_update,
+    )
+    console.print("\n[bold cyan]Platform[/bold cyan]")
+    console.print(f"  Kali: {snap.get('is_kali')} | Debian-like: {snap.get('is_debian_like')}")
+    tbl = Table(title="External tools (PATH)", box=box.ROUNDED)
+    tbl.add_column("Tool", style="cyan")
+    tbl.add_column("Present", style="magenta")
+    tbl.add_column("Path", style="dim")
+    for name, row in (snap.get("tools") or {}).items():
+        tbl.add_row(
+            name,
+            "yes" if row.get("present") else "no",
+            row.get("path") or "",
+        )
+    console.print(tbl)
+
+    miss = snap.get("missing_apt_packages") or []
+    if miss:
+        console.print(f"\n[yellow][!][/yellow] Missing packages for current recon config: [cyan]{' '.join(miss)}[/cyan]")
+        if not install:
+            console.print(
+                "[dim]Re-run with --install to apt-get install (requires passwordless sudo), "
+                "or: sudo apt-get install -y " + " ".join(miss) + "[/dim]"
+            )
+    else:
+        console.print("\n[green][+][/green] All required external tools for this config are on PATH.")
+
+    if err:
+        console.print(f"\n[red][!][/red] {err}")
+        sys.exit(1)
+
+    mods = [m.strip() for m in "subdomain,portscan,technology".split(",")]
+    meth = build_methodology_block(mods, recon_cfg, snap)
+    console.print("\n[bold cyan]Recon methodology (default modules)[/bold cyan]")
+    for ph in meth.get("phases") or []:
+        st = "[green]ready[/green]" if ph.get("ready") else "[yellow]not ready[/yellow]"
+        console.print(f"  {ph.get('phase_id')} {ph.get('name')}: {st} — {ph.get('detail')}")
+
+    console.print("\n[dim]Tip: methodology phases depend on --modules on real recon runs.[/dim]")
+
+
+def main():
+    """Entry point: `blackbox-recon …` (recon) or `blackbox-recon kali-setup …`."""
+    if len(sys.argv) > 1 and sys.argv[1] == "kali-setup":
+        sys.argv.pop(1)
+        kali_setup_command.main(standalone_mode=True)
+    else:
+        recon_main.main(standalone_mode=True)
+
+
 def generate_markdown_report(results: dict, output_file: str):
     """Generate a Markdown report."""
-    with open(output_file, 'w') as f:
-        f.write(f"# Reconnaissance Report: {results['target']}\n\n")
-        f.write(f"**Generated:** {results['timestamp']}\n\n")
-        
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(f"# Reconnaissance Report: {results.get('target', '')}\n\n")
+        f.write(f"**Schema:** {results.get('schema_version', '1.0')}  \n")
+        f.write(f"**Generated:** {results.get('timestamp', '')}  \n")
+        f.write(f"**Completed (UTC):** {results.get('recon_completed_utc', '')}\n\n")
+
+        plat = results.get("platform_toolchain") or {}
+        if plat:
+            f.write("## Platform toolchain\n\n")
+            f.write(f"- **Kali detected:** {plat.get('is_kali')} | **Debian-like:** {plat.get('is_debian_like')}\n")
+            miss = plat.get("missing_apt_packages") or []
+            if miss:
+                f.write(f"- **Missing apt packages (for this config):** {', '.join(miss)}\n")
+            f.write("\n")
+
+        meth = results.get("recon_methodology") or {}
+        phases = meth.get("phases") or []
+        if phases:
+            f.write("## Recon methodology (phase readiness)\n\n")
+            for ph in phases:
+                ok = ph.get("ready")
+                f.write(
+                    f"- **{ph.get('phase_id')} {ph.get('name')}** — "
+                    f"{'ready' if ok else 'not ready'}: {ph.get('detail')}\n"
+                )
+            f.write("\n")
+
+        trace = results.get("recon_phase_trace") or []
+        if trace:
+            f.write("## PTES-style execution trace (what ran)\n\n")
+            f.write(
+                "Per-phase log of tooling: Python stack vs external binaries (`nmap`, `nslookup`, "
+                "`gobuster`/`dirb`). Each `command` value is the exact line executed where applicable.\n\n"
+            )
+            for row in trace:
+                f.write(f"### {row.get('phase_id')} — {row.get('phase_name')}\n\n")
+                f.write(f"- **Status:** {row.get('status')}  \n")
+                if row.get("ptes_mapping"):
+                    f.write(f"- **PTES mapping:** {row['ptes_mapping']}  \n")
+                if row.get("detail"):
+                    f.write(f"- **Outcome:** {row['detail']}  \n")
+                for line in row.get("stack_lines") or []:
+                    f.write(f"- {line}  \n")
+                cmds = row.get("commands_executed") or []
+                if cmds:
+                    f.write("\n| Label | Command / description |\n|-------|------------------------|\n")
+                    for c in cmds:
+                        lab = str(c.get("label", "")).replace("|", "\\|")
+                        cmd = str(c.get("command", "")).replace("|", "\\|")
+                        if len(cmd) > 200:
+                            cmd = cmd[:197] + "..."
+                        f.write(f"| `{lab}` | `{cmd}` |\n")
+                f.write("\n")
+
+        snap = results.get("executive_snapshot") or {}
+        if snap:
+            f.write("## Executive snapshot\n\n")
+            f.write(f"- **Open ports:** {snap.get('open_port_count', 0)}\n")
+            f.write(f"- **Web URLs scanned:** {snap.get('web_url_candidates', 0)}\n")
+            if snap.get("dns_names_observed"):
+                f.write(f"- **DNS names observed:** {', '.join(snap['dns_names_observed'][:15])}\n")
+            f.write("\n")
+
         f.write("## Summary\n\n")
-        summary = results.get('summary', {})
+        summary = results.get("summary", {})
         f.write(f"- **Subdomains Found:** {summary.get('total_subdomains', 0)}\n")
         f.write(f"- **Open Ports:** {summary.get('total_open_ports', 0)}\n")
-        f.write(f"- **Web Services:** {summary.get('web_services', 0)}\n\n")
-        
-        if results.get('ai_analysis'):
+        f.write(f"- **Web Services (subdomain HTTP):** {summary.get('web_services', 0)}\n")
+        f.write(f"- **Nslookup runs:** {summary.get('nslookup_runs', 0)}\n")
+        f.write(f"- **Directory scan runs:** {summary.get('directory_scan_runs', 0)}\n")
+        f.write(f"- **Interesting directory hits:** {summary.get('directory_interesting_hits', 0)}\n\n")
+
+        dns = results.get("dns_intelligence") or {}
+        lookups = dns.get("nslookups") or []
+        if lookups:
+            f.write("## DNS intelligence (nslookup)\n\n")
+            for row in lookups:
+                f.write(f"### {row.get('target')}\n\n")
+                f.write(f"- Status: `{row.get('status')}`  \n")
+                if row.get("command"):
+                    f.write(f"- Command: `{row['command']}`\n")
+                parsed = row.get("parsed") or {}
+                if parsed.get("ptr_or_canonical_names"):
+                    f.write(f"- Names: {', '.join(parsed['ptr_or_canonical_names'])}\n")
+                f.write("\n")
+
+        nmap_meta = results.get("nmap_scan") or {}
+        per_host = nmap_meta.get("per_host") or []
+        if per_host:
+            f.write("## Nmap (per host)\n\n")
+            for h in per_host:
+                f.write(f"- **{h.get('host')}:** `{h.get('command')}`  \n")
+                f.write(
+                    f"  - XML parseable: {h.get('xml_parseable')} | "
+                    f"Open ports in XML: {h.get('open_ports_in_xml')}\n"
+                )
+            f.write("\n")
+
+        if results.get("ai_analysis"):
             f.write("## AI Analysis\n\n")
-            f.write(results['ai_analysis'].get('technical_analysis', ''))
+            f.write(results["ai_analysis"].get("technical_analysis", ""))
             f.write("\n\n")
-        
-        if results.get('subdomains'):
+
+        if results.get("subdomains"):
             f.write("## Subdomains\n\n")
             f.write("| Subdomain | IP Addresses | Status |\n")
             f.write("|-----------|--------------|--------|\n")
-            for sub in results['subdomains']:
-                ips = ', '.join(sub.get('ip_addresses', [])[:2])
-                status = sub.get('status_code', 'N/A')
+            for sub in results["subdomains"]:
+                ips = ", ".join(sub.get("ip_addresses", [])[:2])
+                status = sub.get("status_code", "N/A")
                 f.write(f"| {sub['subdomain']} | {ips} | {status} |\n")
             f.write("\n")
-        
-        if results.get('ports'):
-            f.write("## Open Ports\n\n")
-            f.write("| Host | Port | Service |\n")
-            f.write("|------|------|----------|\n")
-            for port in results['ports']:
-                f.write(f"| {port['host']} | {port['port']} | {port.get('service', 'unknown')} |\n")
+
+        if results.get("ports"):
+            f.write("## Open ports / services\n\n")
+            f.write("| Host | Port | Service | Version / details |\n")
+            f.write("|------|------|---------|---------------------|\n")
+            for port in results["ports"]:
+                ver = (port.get("version") or "").replace("|", "\\|")
+                if len(ver) > 120:
+                    ver = ver[:117] + "..."
+                f.write(
+                    f"| {port['host']} | {port['port']} | {port.get('service', 'unknown')} | {ver} |\n"
+                )
             f.write("\n")
 
+        web = results.get("web_content_discovery") or {}
+        scans = web.get("directory_scans") or []
+        if scans:
+            f.write("## Web content discovery\n\n")
+            for s in scans:
+                f.write(f"### {s.get('base_url')}\n\n")
+                f.write(f"- Tool: {s.get('tool')} | Status: {s.get('status')}\n")
+                hits = s.get("findings_interesting") or []
+                if hits:
+                    f.write("\n| Path | Status |\n|------|--------|\n")
+                    for h in hits[:40]:
+                        f.write(f"| `{h.get('path', '')}` | {h.get('status_code')} |\n")
+                f.write("\n")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
