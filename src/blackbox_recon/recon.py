@@ -1,6 +1,7 @@
 """Core reconnaissance engine."""
 
 import asyncio
+import ipaddress
 import socket
 from datetime import datetime
 from functools import partial
@@ -551,13 +552,19 @@ class ReconEngine:
         tr = PhaseTracer(self.results, echo=echo_phases)
 
         if "subdomain" in modules:
-            tr.start(
-                "M1",
-                [
-                    "Stack: Python 3 — asyncio + socket.gethostbyname_ex + requests (HTTP probe where DNS resolves)",
-                    f"Wordlist: built-in {len(SubdomainEnumerator.COMMON_SUBDOMAINS)} common sub-labels against `{target}`",
-                ],
-            )
+            m1_lines = [
+                "Stack: Python 3 — asyncio + socket.gethostbyname_ex + requests (HTTP probe where DNS resolves)",
+                f"Wordlist: built-in {len(SubdomainEnumerator.COMMON_SUBDOMAINS)} common sub-labels against `{target}`",
+            ]
+            try:
+                ipaddress.ip_address(target.strip())
+                m1_lines.append(
+                    "Note: target is a bare IP — DNS brute uses labels like `www.<target>`; expect few or no hits. "
+                    "Use a hostname apex for meaningful subdomain discovery."
+                )
+            except ValueError:
+                pass
+            tr.start("M1", m1_lines)
             tr.note_command(
                 "method",
                 f"DNS brute: enumerate `{len(SubdomainEnumerator.COMMON_SUBDOMAINS)}` labels → gethostbyname_ex; "
@@ -588,10 +595,14 @@ class ReconEngine:
                     f"Targets: {len(ips)} IPv4 address(es) plus apex string `{target}`",
                 ],
             )
-            print(f"[+] Running nslookup (PTR / forward hints) for {len(ips)} IP(s) + target string...")
             loop = asyncio.get_running_loop()
             lookups: List[Dict[str, Any]] = []
+            queried: Set[str] = set()
             for ip in sorted(ips):
+                key = str(ip).strip()
+                if key in queried:
+                    continue
+                queried.add(key)
                 ns = await loop.run_in_executor(
                     None,
                     partial(
@@ -603,17 +614,28 @@ class ReconEngine:
                 lookups.append(ns)
                 cmd = ns.get("command") or f"nslookup {ip}"
                 tr.note_command("nslookup", cmd, target=ip, exit_code=ns.get("exit_code"))
-            ns_target = await loop.run_in_executor(
-                None,
-                partial(
-                    run_nslookup,
-                    target,
-                    int(self.config.get("nslookup_timeout_sec", 120)),
-                ),
+            apex = target.strip()
+            if apex not in queried:
+                ns_target = await loop.run_in_executor(
+                    None,
+                    partial(
+                        run_nslookup,
+                        target,
+                        int(self.config.get("nslookup_timeout_sec", 120)),
+                    ),
+                )
+                lookups.append(ns_target)
+                cmdt = ns_target.get("command") or f"nslookup {target}"
+                tr.note_command("nslookup", cmdt, target=target, exit_code=ns_target.get("exit_code"))
+            else:
+                tr.note_command(
+                    "nslookup_skipped_duplicate",
+                    f"Apex `{apex}` already covered by IP nslookup above; not run twice",
+                )
+            print(
+                f"[+] Running nslookup (PTR / forward hints): {len(lookups)} run(s) "
+                f"for {len(queried)} unique IP(s) plus apex when needed"
             )
-            lookups.append(ns_target)
-            cmdt = ns_target.get("command") or f"nslookup {target}"
-            tr.note_command("nslookup", cmdt, target=target, exit_code=ns_target.get("exit_code"))
             self.results["dns_intelligence"]["nslookups"] = lookups
             tr.finish("completed", f"{len(lookups)} nslookup run(s) recorded")
         else:
@@ -763,7 +785,7 @@ class ReconEngine:
                         )
                         scans.append(rep)
                         tlab = rep.get("tool") or "directory_scan"
-                        cmd = rep.get("command") or "(no command — skipped or failed)"
+                        cmd = rep.get("command") or rep.get("reason") or "(no subprocess — see status/reason in JSON)"
                         tr.note_command(tlab, cmd, base_url=rep.get("base_url"), status=rep.get("status"))
                     self.results["web_content_discovery"]["directory_scans"] = scans
                     hits = sum(len(s.get("findings_interesting") or []) for s in scans)

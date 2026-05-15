@@ -318,8 +318,8 @@ def recon_main(
                 sys.exit(1)
         else:
             console.print(
-                "[yellow][!] Lab mode: engagement gates off (--lab, --no-engagement-gates, or BLACKBOX_RECON_LAB=1). "
-                "No authorization/scope/workspace enforcement.[/yellow]"
+                "[yellow][!] Lab mode: engagement gates off (--lab / BLACKBOX_RECON_LAB=1). "
+                "No authorization, scope, or workspace enforcement.[/yellow]"
             )
 
         engine = ReconEngine(recon_config, engagement_rt)

@@ -266,11 +266,39 @@ def _strip_local_visible_thinking_preamble(text: str) -> str:
     return t_norm
 
 
+def _drop_star_prefixed_rubric_lines(text: str) -> str:
+    """Remove Qwen-style rubric echoes that start with a star bullet (not part of the deliverable)."""
+    kill = re.compile(
+        r"(?mi)^\s*\*+\s*("
+        r"Must be\b|"
+        r"Format:\b|"
+        r"Constraint:\b|"
+        r"Draft:\b|"
+        r"Refining\b|"
+        r"Bullet\s+\d+:|"
+        r"Each bullet\b|"
+        r"Each path\b|"
+        r"Rules for\b|"
+        r"Exactly\s+\d+\s+bullets?\b|"
+        r"Up to\s+\d+\s+bullets?\b|"
+        r"Provide up to\b"
+        r").*$"
+    )
+    out: List[str] = []
+    for line in text.splitlines():
+        if kill.match(line):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def _finalize_local_assistant_markdown(text: str) -> str:
     """Normalize local LLM text for display (strip template think spans + visible planning)."""
     t = _strip_rich_panel_borders(text)
     t = _THINK_SPAN_RE.sub("", t).strip()
-    return _strip_local_visible_thinking_preamble(t)
+    t = _strip_local_visible_thinking_preamble(t)
+    t = _drop_star_prefixed_rubric_lines(t)
+    return t
 
 
 def check_local_llm_connection(base_url: str, timeout: float = 10.0) -> Tuple[str, Optional[str]]:
@@ -500,6 +528,8 @@ Each bullet must use this format:
 6) Analyst caveats
 Provide up to 3 bullets.
 Mention uncertainty caused by missing version data, unauthenticated scan limits, filtered ports, or incomplete tool output.
+- Do not echo instruction rubric (no "Must be 2 sentences", "Format:", "Constraint:", or "Refining" meta-lines).
+- Do not describe your drafting process; output only the finished numbered sections.
 """.strip()
 
 
