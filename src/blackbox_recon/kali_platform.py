@@ -21,9 +21,13 @@ class ExternalTool:
 
 TOOLS_NMAP = ExternalTool("nmap", ("nmap",), ("nmap",))
 TOOLS_NSLOOKUP = ExternalTool("nslookup", ("nslookup",), ("dnsutils",))
+TOOLS_DIG = ExternalTool("dig", ("dig",), ("dnsutils",))
 TOOLS_GOBUSTER = ExternalTool("gobuster", ("gobuster",), ("gobuster",))
 TOOLS_DIRB = ExternalTool("dirb", ("dirb",), ("dirb",))
 TOOLS_SSLSCAN = ExternalTool("sslscan", ("sslscan",), ("sslscan",))
+TOOLS_WHATWEB = ExternalTool("whatweb", ("whatweb",), ("whatweb",))
+TOOLS_WAFW00F = ExternalTool("wafw00f", ("wafw00f",), ("wafw00f",))
+TOOLS_SMBCLIENT = ExternalTool("smbclient", ("smbclient",), ("smbclient",))
 
 
 def read_os_release() -> Dict[str, str]:
@@ -87,6 +91,12 @@ def missing_packages_for_config(cfg: Dict[str, Any]) -> Tuple[List[str], List[st
             missing_ids.append(TOOLS_NSLOOKUP.tool_id)
             pkgs.update(TOOLS_NSLOOKUP.debian_packages)
 
+    if bool(cfg.get("dns_enrichment_enabled", True)):
+        st = tool_status(TOOLS_DIG)
+        if not st["present"]:
+            missing_ids.append(TOOLS_DIG.tool_id)
+            pkgs.update(TOOLS_DIG.debian_packages)
+
     need_dir, pref = _directory_scan_needs(cfg)
     if need_dir:
         go = tool_status(TOOLS_GOBUSTER)["present"]
@@ -106,10 +116,21 @@ def missing_packages_for_config(cfg: Dict[str, Any]) -> Tuple[List[str], List[st
     if bool(cfg.get("tls_scan_enabled", True)):
         st = tool_status(TOOLS_SSLSCAN)
         if not st["present"]:
-            # TLS module can still collect certificate metadata with Python ssl,
-            # but sslscan provides the Kali-native protocol/cipher inventory.
             missing_ids.append(TOOLS_SSLSCAN.tool_id)
             pkgs.update(TOOLS_SSLSCAN.debian_packages)
+
+    if bool(cfg.get("web_fingerprint_enabled", True)):
+        for tool in (TOOLS_WHATWEB, TOOLS_WAFW00F):
+            st = tool_status(tool)
+            if not st["present"]:
+                missing_ids.append(tool.tool_id)
+                pkgs.update(tool.debian_packages)
+
+    if bool(cfg.get("service_enum_enabled", True)):
+        st = tool_status(TOOLS_SMBCLIENT)
+        if not st["present"]:
+            missing_ids.append(TOOLS_SMBCLIENT.tool_id)
+            pkgs.update(TOOLS_SMBCLIENT.debian_packages)
 
     return missing_ids, sorted(pkgs)
 
@@ -124,9 +145,13 @@ def build_toolchain_snapshot(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "tools": {
             "nmap": tool_status(TOOLS_NMAP),
             "nslookup": tool_status(TOOLS_NSLOOKUP),
+            "dig": tool_status(TOOLS_DIG),
             "gobuster": tool_status(TOOLS_GOBUSTER),
             "dirb": tool_status(TOOLS_DIRB),
             "sslscan": tool_status(TOOLS_SSLSCAN),
+            "whatweb": tool_status(TOOLS_WHATWEB),
+            "wafw00f": tool_status(TOOLS_WAFW00F),
+            "smbclient": tool_status(TOOLS_SMBCLIENT),
         },
         "missing_tool_ids": miss_ids,
         "missing_apt_packages": miss_pkgs,
