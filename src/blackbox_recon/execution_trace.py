@@ -5,6 +5,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from rich import print as rprint
+from rich.markup import escape
+
 from .methodology import DEFAULT_PHASES
 
 
@@ -21,6 +24,28 @@ def _phase_lookup(phase_id: str):
 
 def _banner_line(ch: str = "─", width: int = 68) -> str:
     return ch * width
+
+
+# Longest-first so "Wordlist path:" wins over "Wordlist:"
+_STACK_PREFIXES = (
+    "Wordlist path:",
+    "Service enrichment:",
+    "Tool preference:",
+    "Configured ",
+    "Objective:",
+    "Stack:",
+    "Wordlist:",
+    "Note:",
+    "Targets:",
+)
+
+
+def _stack_line_markup(line: str) -> str:
+    """Apply Rich markup to a phase stack line (keys vs body)."""
+    for p in _STACK_PREFIXES:
+        if line.startswith(p):
+            return f"[bold yellow]{escape(p)}[/bold yellow]{escape(line[len(p) :])}"
+    return escape(line)
 
 
 class PhaseTracer:
@@ -59,14 +84,17 @@ class PhaseTracer:
         }
         self._ensure_list().append(self._entry)
         if self.echo:
-            print()
-            print(_banner_line("─", 72))
-            print(f"  PTES {phase_id} · {title}")
+            rprint()
+            rprint(f"[dim]{escape(_banner_line('─', 72))}[/dim]")
+            rprint(
+                f"  [bold cyan]PTES {escape(phase_id)}[/bold cyan] [dim]·[/dim] "
+                f"[bold white]{escape(title)}[/bold white]"
+            )
             if ptes:
-                print(f"  {ptes.replace('>', '›')}")
-            print(_banner_line("─", 72))
+                rprint(f"  [italic bright_blue]{escape(ptes.replace('>', '›'))}[/italic bright_blue]")
+            rprint(f"[dim]{escape(_banner_line('─', 72))}[/dim]")
             for line in stack_lines:
-                print(f"    · {line}")
+                rprint(f"    [dim]·[/dim] {_stack_line_markup(line)}")
 
     def note_command(self, label: str, command: str, **extra: Any) -> None:
         if not self._entry:
@@ -79,7 +107,10 @@ class PhaseTracer:
         row.update({k: v for k, v in extra.items() if v is not None})
         self._entry.setdefault("commands_executed", []).append(row)
         if self.echo:
-            print(f"    [exec] {label}: {command}")
+            rprint(
+                f"    [dim][exec][/dim] [yellow]{escape(label)}[/yellow]: "
+                f"[bright_white]{escape(command)}[/bright_white]"
+            )
 
     def finish(self, status: str, detail: str = "") -> None:
         if not self._entry:
@@ -88,7 +119,10 @@ class PhaseTracer:
         self._entry["status"] = status
         self._entry["detail"] = detail
         if self.echo and detail:
-            print(f"  → Phase complete ({status}): {detail}")
+            rprint(
+                f"  [green]→[/green] Phase complete "
+                f"([bold]{escape(status)}[/bold]): [default]{escape(detail)}[/default]"
+            )
         self._entry = None
 
     def skip(self, phase_id: str, reason: str) -> None:
@@ -108,11 +142,15 @@ class PhaseTracer:
         }
         self._ensure_list().append(entry)
         if self.echo:
-            print()
-            print(_banner_line("─", 72))
-            print(f"  PTES {phase_id} · {title}  [skipped]")
-            print(f"    Reason: {reason}")
-            print(_banner_line("─", 72))
+            rprint()
+            rprint(f"[dim]{escape(_banner_line('─', 72))}[/dim]")
+            rprint(
+                f"  [bold cyan]PTES {escape(phase_id)}[/bold cyan] [dim]·[/dim] "
+                f"[bold white]{escape(title)}[/bold white] "
+                f"[yellow][skipped][/yellow]"
+            )
+            rprint(f"    [dim]Reason:[/dim] [white]{escape(reason)}[/white]")
+            rprint(f"[dim]{escape(_banner_line('─', 72))}[/dim]")
 
 
 def summarize_execution_trace(trace: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -142,17 +180,25 @@ def print_execution_recap(results: Dict[str, Any], *, echo: bool = True) -> None
     trace = results.get("recon_phase_trace") or []
     if not echo or not trace:
         return
-    print()
-    print(_banner_line("─", 72))
-    print("[+] Execution recap (full commands in JSON: recon_phase_trace)")
-    print(_banner_line("─", 72))
+    rprint()
+    rprint(f"[dim]{escape(_banner_line('─', 72))}[/dim]")
+    rprint(
+        f"[bold green]{escape('[+]')}[/bold green] [bold]Execution recap[/bold] "
+        "[dim](full commands in JSON: [cyan]recon_phase_trace[/cyan])[/dim]"
+    )
+    rprint(f"[dim]{escape(_banner_line('─', 72))}[/dim]")
     for row in trace:
         st = row.get("status", "?")
         pid = row.get("phase_id", "?")
         name = row.get("phase_name", "")
         ncmd = len(row.get("commands_executed") or [])
         detail = (row.get("detail") or "")[:120]
-        print(f"  {pid}  [{st}]  {name}  ·  {ncmd} command(s)")
+        rprint(
+            f"  [bold cyan]{escape(str(pid))}[/bold cyan]  "
+            f"[magenta]{escape('[' + str(st) + ']')}[/magenta]  "
+            f"[white]{escape(str(name))}[/white]  [dim]·[/dim]  "
+            f"[yellow]{ncmd}[/yellow] command(s)"
+        )
         if detail and st != "skipped":
-            print(f"      {detail}")
-    print(_banner_line("─", 72))
+            rprint(f"      [dim]{escape(detail)}[/dim]")
+    rprint(f"[dim]{escape(_banner_line('─', 72))}[/dim]")

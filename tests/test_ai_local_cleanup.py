@@ -3,6 +3,7 @@
 from blackbox_recon.ai_analyzer import (
     _drop_star_prefixed_rubric_lines,
     _finalize_local_assistant_markdown,
+    _strip_trailing_meta_followup_section,
     _unwrap_star_draft_lines,
 )
 
@@ -30,6 +31,23 @@ def test_unwrap_draft_preserves_prose():
     out = _unwrap_star_draft_lines(raw)
     assert "Draft:" not in out
     assert out.strip().startswith("The target runs")
+
+
+def test_strip_trailing_fake_section7_without_json():
+    body = (
+        "6) Analyst caveats\n"
+        "- Note about scans.\n\n"
+        "      *   **7) Recommended follow-up tooling:**\n"
+        "          *   One line JSON at the end.\n"
+    )
+    out = _strip_trailing_meta_followup_section(body)
+    assert "7) Recommended" not in out
+    assert "Analyst caveats" in out
+
+
+def test_strip_trailing_preserves_body_when_next_steps_json_present():
+    body = '6) Caveats\nOK\nNEXT_STEPS_JSON:{"recommended_next_steps":[]}\n'
+    assert _strip_trailing_meta_followup_section(body) == body
 
 
 def test_finalize_strips_qwen_style_rubric_block():

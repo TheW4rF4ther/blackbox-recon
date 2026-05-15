@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 
 import requests
 from requests import HTTPError
+from rich import print as rprint
+from rich.markup import escape
 
 
 # Strip common "thinking" spans (Qwen / similar chat templates).
@@ -307,7 +309,16 @@ def _drop_star_prefixed_rubric_lines(text: str) -> str:
         r"The JSON doesn'?t\b|"
         r"Since the prompt\b|"
         r"Based on the data\b|"
-        r"There aren'?t many\b"
+        r"There aren'?t many\b|"
+        r"Drafting\b|"
+        r"One line JSON\b|"
+        r"Pattern:|"
+        r"Mention uncertainty\b|"
+        r"Data limitation\b|"
+        r"Summarize exposed\b|"
+        r"1-\d+\s+paths\.?\s*$|"
+        r"Actually,\s+standard practice\b|"
+        r"Actually,\s+based\b"
         r").*$"
     )
     out: List[str] = []
@@ -334,6 +345,29 @@ def _collapse_blank_lines(text: str, max_blank_run: int = 2) -> str:
     return "\n".join(out).strip()
 
 
+def _strip_trailing_meta_followup_section(text: str) -> str:
+    """
+    Remove model echoes of a fake ``7) Recommended…`` block when the real ``NEXT_STEPS_JSON:`` line is absent.
+    """
+    if not text.strip():
+        return text
+    if NEXT_STEPS_MARKER in text:
+        return text
+    patterns = [
+        r"(?mi)^\s*\*+\s*\*+\s*7\)\s*Recommended\b[^\n]*$",
+        r"(?mi)^\s*\*+\s*7\)\s*Recommended\b[^\n]*$",
+        r"(?mi)^\s*\*+\s*\*{0,2}\s*Recommended follow-up tooling\b[^\n]*$",
+    ]
+    cut: Optional[int] = None
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.MULTILINE)
+        if m and (cut is None or m.start() < cut):
+            cut = m.start()
+    if cut is not None:
+        return text[:cut].rstrip()
+    return text
+
+
 def _finalize_local_assistant_markdown(text: str) -> str:
     """Normalize local LLM text for display (strip template think spans + visible planning)."""
     t = _strip_rich_panel_borders(text)
@@ -343,6 +377,7 @@ def _finalize_local_assistant_markdown(text: str) -> str:
     t = _drop_star_prefixed_rubric_lines(t)
     t = _strip_local_visible_thinking_preamble(t)
     t = _drop_star_prefixed_rubric_lines(t)
+    t = _strip_trailing_meta_followup_section(t)
     t = _collapse_blank_lines(t)
     return t
 
@@ -934,7 +969,10 @@ Be specific, actionable, and focus on what a penetration tester should prioritiz
     
     def analyze_recon_data(self, recon_data: Dict[str, Any]) -> AnalysisResult:
         """Analyze reconnaissance data and return structured results."""
-        print(f"[AI] Analyzing attack surface with {self.provider_name}...")
+        rprint(
+            f"[bold cyan]{escape('[AI]')}[/bold cyan] Analyzing attack surface with "
+            f"[yellow]{escape(self.provider_name)}[/yellow]…"
+        )
         prompt = self.ANALYSIS_PROMPT if self.provider_name != "local" else LOCAL_ANALYSIS_PROMPT
         raw_analysis = self.provider.analyze(recon_data, prompt)
 

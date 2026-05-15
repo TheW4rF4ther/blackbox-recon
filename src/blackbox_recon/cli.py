@@ -3,6 +3,7 @@
 
 import asyncio
 import os
+import re
 import shutil
 import sys
 from datetime import datetime
@@ -14,6 +15,7 @@ import click
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
+from rich.text import Text
 from rich import box
 
 from .config import Config, create_default_config
@@ -41,6 +43,30 @@ for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8", errors="replace")
 
 console = Console()
+
+
+def build_analysis_panel_text(body: str) -> Text:
+    """Syntax-safe Rich ``Text`` with highlights for section headers and key bullets."""
+    t = Text()
+    for line in body.splitlines():
+        st = line.strip()
+        if re.match(r"^\d+\)\s+\S", st) and len(st) <= 130:
+            t.append(line + "\n", style="bold cyan")
+        elif re.match(r"^\s*-\s+", st) and "|" in st and (
+            re.search(r"Severity:\s*", st)
+            or re.search(r"^\s*-\s*<(?:Confirmed|Candidate|Unclear)", st)
+            or re.search(r"Priority:\s*P[123]", st)
+        ):
+            t.append(line + "\n", style="green")
+        elif re.match(
+            r"^\s*(?:\*+\s*)?(?:Entry point:|Risk chain:|Potential impact:)\s*",
+            line,
+            re.I,
+        ):
+            t.append(line + "\n", style="yellow")
+        else:
+            t.append(line + "\n")
+    return t
 
 
 def resolve_report_path(
@@ -336,11 +362,16 @@ def recon_main(
         trace = results.get("recon_phase_trace") or []
         if trace:
             console.print("\n[bold cyan]Recon phases (this run)[/bold cyan]")
-            et = Table(title="Commands executed per PTES phase", box=box.SIMPLE_HEAD)
-            et.add_column("Phase", style="cyan", no_wrap=True, width=5)
-            et.add_column("Status", style="magenta", width=11)
-            et.add_column("#", justify="right", width=3)
-            et.add_column("Representative command", style="dim", max_width=76, overflow="ellipsis")
+            et = Table(
+                title="[bold cyan]Commands executed per PTES phase[/bold cyan]",
+                box=box.SIMPLE_HEAD,
+                show_header=True,
+                header_style="bold bright_white",
+            )
+            et.add_column("Phase", style="bold cyan", no_wrap=True, width=5)
+            et.add_column("Status", style="bold magenta", width=11)
+            et.add_column("#", justify="right", style="yellow", width=3)
+            et.add_column("Representative command", style="bright_white", max_width=76, overflow="ellipsis")
             for row in trace:
                 cmds = row.get("commands_executed") or []
                 samp = ""
@@ -392,19 +423,22 @@ def recon_main(
                 console.print("\n[bold green]AI analysis[/bold green] [dim]· generating report…[/dim]")
                 analysis = analyzer.analyze_recon_data(results)
 
-                analysis_body = (analysis.technical_analysis or "").strip()
-                if not analysis_body:
-                    analysis_body = (
-                        "[dim]The model returned no visible analysis text. "
-                        "In LM Studio: raise max tokens, disable extended reasoning for this model, "
-                        "or use a non-thinking chat model. Raw JSON is still in the saved report.[/dim]"
+                raw_ta = (analysis.technical_analysis or "").strip()
+                if not raw_ta:
+                    panel_body = Text(
+                        "The model returned no visible analysis text. In LM Studio: raise max tokens, "
+                        "disable extended reasoning for this model, or use a non-thinking chat model. "
+                        "Raw JSON is still in the saved report.",
+                        style="dim",
                     )
+                else:
+                    panel_body = build_analysis_panel_text(raw_ta)
                 console.print(
                     Panel(
-                        analysis_body,
-                        title="[bold]Attack surface analysis[/bold]",
-                        subtitle="[dim]Advisory triage from this run · not exploitation guidance[/dim]",
+                        panel_body,
+                        title="[bold bright_white]Attack surface analysis[/bold bright_white]",
                         title_align="left",
+                        subtitle="[dim italic]Advisory triage from this run · not exploitation guidance[/dim italic]",
                         border_style="green",
                         padding=(1, 2),
                     )
@@ -423,10 +457,14 @@ def recon_main(
                         "\n[bold cyan]AI — recommended follow-up tools[/bold cyan] "
                         "[dim](advisory only; Blackbox Recon does not run these)[/dim]"
                     )
-                    nst = Table(title="Suggested next moves", box=box.ROUNDED)
-                    nst.add_column("Tool", style="cyan", max_width=18)
+                    nst = Table(
+                        title="[bold cyan]Suggested next moves[/bold cyan]",
+                        box=box.ROUNDED,
+                        header_style="bold yellow",
+                    )
+                    nst.add_column("Tool", style="bold cyan", max_width=18)
                     nst.add_column("Objective", style="white", max_width=36)
-                    nst.add_column("Example CLI (placeholders)", style="dim", max_width=44)
+                    nst.add_column("Example CLI (placeholders)", style="dim cyan", max_width=44)
                     for row in analysis.recommended_next_steps[:8]:
                         nst.add_row(
                             row.get("tool", "—") or "—",
@@ -444,9 +482,13 @@ def recon_main(
         
         # Display summary table
         console.print("\n[bold green]Reconnaissance Summary[/bold green]")
-        table = Table(box=box.ROUNDED)
-        table.add_column("Metric", style="cyan")
-        table.add_column("Count", style="magenta")
+        table = Table(
+            title="[bold yellow]Counts[/bold yellow]",
+            box=box.ROUNDED,
+            header_style="bold cyan",
+        )
+        table.add_column("Metric", style="yellow")
+        table.add_column("Count", style="bold white", justify="right")
         
         summary = results.get('summary', {})
         table.add_row("Subdomains Found", str(summary.get('total_subdomains', 0)))

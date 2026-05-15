@@ -15,6 +15,9 @@ from bs4 import BeautifulSoup
 # Technology probes intentionally skip TLS verification (self-signed / lab targets).
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+from rich import print as rprint
+from rich.markup import escape
+
 from .nmap_top1000_tcp import NMAP_TOP1000_TCP
 from .service_detection import (
     find_nmap_executable,
@@ -91,7 +94,7 @@ class SubdomainEnumerator:
         
     async def enumerate(self, domain: str) -> List[SubdomainResult]:
         """Enumerate subdomains for a target domain."""
-        print(f"[+] Enumerating subdomains for {domain}...")
+        rprint(f"[bold green]{escape('[+]')}[/bold green] Enumerating subdomains for [cyan]{escape(domain)}[/cyan]…")
         
         subdomains = set()
         
@@ -111,7 +114,9 @@ class SubdomainEnumerator:
         results = await asyncio.gather(*[bounded_check(t) for t in tasks])
         
         valid_results = [r for r in results if r is not None]
-        print(f"[+] Found {len(valid_results)} valid subdomains")
+        rprint(
+            f"[bold green]{escape('[+]')}[/bold green] Found [yellow]{len(valid_results)}[/yellow] valid subdomains"
+        )
         
         return valid_results
     
@@ -201,7 +206,10 @@ class PortScanner:
 
     async def scan(self, host: str) -> List[PortScanResult]:
         """Scan ports on a host."""
-        print(f"[+] Scanning {len(self.ports)} ports on {host}...")
+        rprint(
+            f"[bold green]{escape('[+]')}[/bold green] Scanning [yellow]{len(self.ports)}[/yellow] ports on "
+            f"[cyan]{escape(host)}[/cyan]…"
+        )
 
         # Limit parallel handshakes so cloud/WAF rate limits are less likely to drop valid opens.
         workers = 64 if len(self.ports) > 64 else max(8, min(len(self.ports), 32))
@@ -215,7 +223,10 @@ class PortScanner:
         results = await asyncio.gather(*tasks)
 
         open_ports = [r for r in results if r is not None and r.state == "open"]
-        print(f"[+] Found {len(open_ports)} open ports on {host}")
+        rprint(
+            f"[bold green]{escape('[+]')}[/bold green] Found [yellow]{len(open_ports)}[/yellow] open ports on "
+            f"[cyan]{escape(host)}[/cyan]"
+        )
         await self._enrich_port_services(host, open_ports)
 
         return open_ports
@@ -226,7 +237,10 @@ class PortScanner:
             return
 
         if self.service_detection in ("banner", "auto"):
-            print(f"[+] Probing services (banner / HTTP) on {len(open_ports)} open port(s) for {host}...")
+            rprint(
+                f"[bold green]{escape('[+]')}[/bold green] Probing services (banner / HTTP) on "
+                f"[yellow]{len(open_ports)}[/yellow] open port(s) for [cyan]{escape(host)}[/cyan]…"
+            )
             sem = asyncio.Semaphore(16)
 
             async def _probe_one(p: PortScanResult) -> None:
@@ -246,7 +260,10 @@ class PortScanner:
         if self.service_detection in ("nmap", "auto"):
             exe = find_nmap_executable(self.nmap_executable)
             if exe:
-                print(f"[+] Running nmap -sV on {host} (open ports only; may take several minutes)...")
+                rprint(
+                    f"[bold green]{escape('[+]')}[/bold green] Running nmap -sV on [cyan]{escape(host)}[/cyan] "
+                    "(open ports only; may take several minutes)…"
+                )
                 loop = asyncio.get_running_loop()
 
                 def _nmap() -> bool:
@@ -254,13 +271,19 @@ class PortScanner:
 
                 ok = await loop.run_in_executor(None, _nmap)
                 if not ok and self.service_detection == "nmap":
-                    print(f"[!] nmap service scan failed or returned no parseable XML for {host}")
+                    rprint(
+                        f"[bold red]{escape('[!]')}[/bold red] nmap service scan failed or returned no parseable "
+                        f"XML for [cyan]{escape(host)}[/cyan]"
+                    )
                 elif not ok:
-                    print(f"[!] nmap service scan skipped or failed for {host}; using banner data if any")
+                    rprint(
+                        f"[bold red]{escape('[!]')}[/bold red] nmap service scan skipped or failed for "
+                        f"[cyan]{escape(host)}[/cyan]; using banner data if any"
+                    )
             elif self.service_detection == "nmap":
-                print(
-                    "[!] nmap not found. Install Nmap or set recon.nmap_executable in config; "
-                    "falling back to banner-only for this run."
+                rprint(
+                    f"[bold red]{escape('[!]')}[/bold red] nmap not found. Install Nmap or set "
+                    f"[yellow]recon.nmap_executable[/yellow] in config; falling back to banner-only for this run."
                 )
 
     async def _check_port(self, host: str, port: int) -> Optional[PortScanResult]:
@@ -532,7 +555,7 @@ class ReconEngine:
         self.results["platform_toolchain"] = snap
         self.results["recon_methodology"] = build_methodology_block(modules, self.config, snap)
         if install_err:
-            print(f"[!] Kali toolchain auto-install: {install_err}")
+            rprint(f"[bold red]{escape('[!]')}[/bold red] Kali toolchain auto-install: [white]{escape(str(install_err))}[/white]")
         if (
             snap.get("is_kali")
             and (snap.get("missing_apt_packages") or [])
@@ -540,14 +563,17 @@ class ReconEngine:
             and not bool(self.config.get("kali_auto_install_missing", False))
         ):
             pkgs = " ".join(snap["missing_apt_packages"])
-            print(
-                f"[!] Kali tool gaps for current config — install:\n"
-                f"    sudo apt-get install -y {pkgs}\n"
-                f"    Or: blackbox-recon kali-setup --install  (passwordless sudo required)"
+            rprint(
+                f"[bold red]{escape('[!]')}[/bold red] Kali tool gaps for current config — install:\n"
+                f"    [dim]sudo apt-get install -y[/dim] [cyan]{escape(pkgs)}[/cyan]\n"
+                f"    Or: [yellow]blackbox-recon kali-setup --install[/yellow] (passwordless sudo required)"
             )
 
-        print(f"\n[+] Starting reconnaissance on {target}")
-        print("=" * 50)
+        rprint()
+        rprint(
+            f"[bold green]{escape('[+]')}[/bold green] Starting reconnaissance on [bold cyan]{escape(target)}[/bold cyan]"
+        )
+        rprint(f"[dim]{escape('=' * 50)}[/dim]")
         echo_phases = bool(self.config.get("recon_verbose_phases", True))
         tr = PhaseTracer(self.results, echo=echo_phases)
 
@@ -632,9 +658,10 @@ class ReconEngine:
                     "nslookup_skipped_duplicate",
                     f"Apex `{apex}` already covered by IP nslookup above; not run twice",
                 )
-            print(
-                f"[+] Running nslookup (PTR / forward hints): {len(lookups)} run(s) "
-                f"for {len(queried)} unique IP(s) plus apex when needed"
+            rprint(
+                f"[bold green]{escape('[+]')}[/bold green] Running nslookup (PTR / forward hints): "
+                f"[yellow]{len(lookups)}[/yellow] run(s) for [yellow]{len(queried)}[/yellow] unique IP(s) "
+                "plus apex when needed"
             )
             self.results["dns_intelligence"]["nslookups"] = lookups
             tr.finish("completed", f"{len(lookups)} nslookup run(s) recorded")
@@ -668,14 +695,18 @@ class ReconEngine:
                     "nmap_profile",
                     f"Per host: nmap -v -p- -A --open -T4 (full TCP + scripts/OS/service); budget {budget}s",
                 )
-                print(
-                    f"[+] Default port scan: nmap -v -p- -A --open (per host; budget {budget}s each). "
-                    "This is thorough and may take a long time."
+                rprint(
+                    f"[bold green]{escape('[+]')}[/bold green] Default port scan: "
+                    f"[cyan]nmap -v -p- -A --open[/cyan] (per host; budget [yellow]{budget}s[/yellow] each). "
+                    "[dim]This is thorough and may take a long time.[/dim]"
                 )
                 loop = asyncio.get_running_loop()
                 all_ports: List[PortScanResult] = []
                 for ip in scan_hosts:
-                    print(f"[+] nmap aggressive scan → {ip}")
+                    rprint(
+                        f"[bold green]{escape('[+]')}[/bold green] nmap aggressive scan [dim]→[/dim] "
+                        f"[cyan]{escape(str(ip))}[/cyan]"
+                    )
                     if self._rt is not None:
                         self._rt.audit("nmap_aggressive_start", host=ip)
                     ok, xml_out, err, cmd = await loop.run_in_executor(
@@ -684,7 +715,10 @@ class ReconEngine:
                     tr.note_command("nmap_aggressive", cmd, host=ip, xml_parseable=bool(ok and ("<nmaprun" in (xml_out or "")[:8000])))
                     rows = parse_nmap_xml_open_tcp_ports(xml_out)
                     if not rows and ok:
-                        print(f"[!] nmap returned no open TCP ports in XML for {ip}")
+                        rprint(
+                            f"[bold red]{escape('[!]')}[/bold red] nmap returned no open TCP ports in XML for "
+                            f"[cyan]{escape(str(ip))}[/cyan]"
+                        )
                     for r in rows:
                         all_ports.append(
                             PortScanResult(
@@ -709,9 +743,10 @@ class ReconEngine:
                 self.results["ports"] = [asdict(p) for p in all_ports]
             else:
                 if mode == "nmap_aggressive" and not exe:
-                    print(
-                        "[!] port_scan_mode=nmap_aggressive but nmap not found; "
-                        "falling back to async TCP connect scan. Install Nmap or set nmap_executable."
+                    rprint(
+                        f"[bold red]{escape('[!]')}[/bold red] [yellow]port_scan_mode=nmap_aggressive[/yellow] but "
+                        "nmap not found; falling back to async TCP connect scan. Install Nmap or set "
+                        "[cyan]nmap_executable[/cyan]."
                     )
                     self.results["nmap_scan"]["mode"] = "tcp_connect_fallback"
                 else:
@@ -760,7 +795,10 @@ class ReconEngine:
                         "No HTTP(S) base URLs derived from open ports (or none in-scope); directory tools not launched",
                     )
                 else:
-                    print(f"[+] Web content discovery on {len(urls)} URL(s) (gobuster/dirb)...")
+                    rprint(
+                        f"[bold green]{escape('[+]')}[/bold green] Web content discovery on "
+                        f"[yellow]{len(urls)}[/yellow] URL(s) [dim](gobuster/dirb)…[/dim]"
+                    )
                     loop = asyncio.get_running_loop()
                     d_timeout = int(self.config.get("directory_timeout_sec", 900))
                     d_threads = int(self.config.get("directory_threads", 10))
@@ -854,12 +892,17 @@ class ReconEngine:
                 target=target,
                 open_ports=len(self.results.get("ports") or []),
             )
-        print("\n[+] Reconnaissance complete")
-        print(f"    Subdomains: {self.results['summary']['total_subdomains']}")
-        print(f"    Open Ports: {self.results['summary']['total_open_ports']}")
-        print(f"    Web Services: {self.results['summary']['web_services']}")
-        print(f"    DNS lookups: {self.results['summary']['nslookup_runs']}")
-        print(f"    Directory scans: {self.results['summary']['directory_scan_runs']}")
+        rprint()
+        rprint(f"[bold green]{escape('[+]')}[/bold green] [bold]Reconnaissance complete[/bold]")
+        rprint(
+            f"    [yellow]Subdomains:[/yellow] [white]{self.results['summary']['total_subdomains']}[/white]  "
+            f"[yellow]Open ports:[/yellow] [white]{self.results['summary']['total_open_ports']}[/white]  "
+            f"[yellow]Web services:[/yellow] [white]{self.results['summary']['web_services']}[/white]"
+        )
+        rprint(
+            f"    [yellow]DNS lookups:[/yellow] [white]{self.results['summary']['nslookup_runs']}[/white]  "
+            f"[yellow]Directory scans:[/yellow] [white]{self.results['summary']['directory_scan_runs']}[/white]"
+        )
         print_execution_recap(self.results, echo=echo_phases)
 
         return self.results
@@ -869,4 +912,4 @@ class ReconEngine:
         if format == "json":
             with open(output_file, "w", encoding="utf-8") as handle:
                 handle.write(dumps_pretty(self.results))
-        print(f"[+] Results saved to: {output_file}")
+        rprint(f"[bold green]{escape('[+]')}[/bold green] Results saved to: [cyan]{escape(output_file)}[/cyan]")
