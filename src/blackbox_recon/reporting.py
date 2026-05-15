@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from .execution_trace import summarize_execution_trace
 
@@ -13,8 +13,34 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _looks_like_recon_results(data: Any) -> bool:
+    return isinstance(data, dict) and (
+        "target" in data
+        and (
+            "ports" in data
+            or "deterministic_findings" in data
+            or "web_content_discovery" in data
+            or "evidence_package" in data
+        )
+    )
+
+
 def dumps_pretty(data: Any) -> str:
-    """Stable, UTF-8 JSON suitable for client deliverables."""
+    """Stable, UTF-8 JSON suitable for operator/client review.
+
+    The scanner's internal result object is intentionally large and contains raw
+    execution detail. For default JSON output, emit the clean pentest report
+    schema instead. Development/debug consumers can still inspect the in-memory
+    result object or extend the CLI with a raw-output flag later.
+    """
+    if _looks_like_recon_results(data):
+        try:
+            from .pentest_report import build_pentest_report
+            data = build_pentest_report(data)
+        except Exception:
+            # Reporting should never break the scan; fall back to raw data if the
+            # clean report builder has a bug.
+            pass
     return json.dumps(data, indent=2, ensure_ascii=False, sort_keys=False) + "\n"
 
 
@@ -76,6 +102,7 @@ def build_executive_snapshot(results: Dict[str, Any]) -> Dict[str, Any]:
         "web_url_candidates": summary.get("web_urls_targeted", 0),
         "dns_names_observed": names[:25],
         "notable_paths_from_bruteforce": interesting_paths[:25],
+        "services_glance": services_glance[:25],
         "modules_executed": (results.get("engagement") or {}).get("modules_requested", []),
         "ptes_execution": ptes_execution,
     }
