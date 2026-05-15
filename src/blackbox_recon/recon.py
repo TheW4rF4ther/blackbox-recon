@@ -29,6 +29,7 @@ from .service_detection import (
 from .dns_intel import run_nslookup
 from .dir_scan import run_directory_scan, resolve_directory_wordlist
 from .reporting import dumps_pretty, build_executive_snapshot, utc_now_iso
+from .evidence import build_evidence_package, _http_like_port_row
 from .engagement import EngagementRuntime, scope_allows_host
 from .kali_platform import ensure_kali_toolchain
 from .methodology import build_methodology_block
@@ -872,16 +873,34 @@ class ReconEngine:
         dir_scans = (self.results.get("web_content_discovery") or {}).get("directory_scans") or []
         interesting_hits = sum(len(s.get("findings_interesting") or []) for s in dir_scans)
 
+        ports_list = self.results["ports"]
+        http_services_detected = sum(
+            1 for p in ports_list if isinstance(p, dict) and _http_like_port_row(p)
+        )
+        tech_list = self.results["technologies"]
+        subdomain_http = len([s for s in self.results["subdomains"] if s.get("status_code")])
+
         self.results["summary"] = {
             "total_subdomains": len(self.results["subdomains"]),
-            "total_open_ports": len(self.results["ports"]),
-            "total_tech_detected": len(self.results["technologies"]),
-            "web_services": len([s for s in self.results["subdomains"] if s.get("status_code")]),
+            "total_open_ports": len(ports_list),
+            "open_tcp_ports": len(ports_list),
+            "total_tech_detected": len(tech_list),
+            "technology_profiles_stored": len(tech_list),
+            "web_services": subdomain_http,
+            "subdomain_http_probes_with_status": subdomain_http,
+            "http_services_detected": http_services_detected,
             "nslookup_runs": len((self.results.get("dns_intelligence") or {}).get("nslookups") or []),
             "web_urls_targeted": len((self.results.get("web_content_discovery") or {}).get("urls_targeted") or []),
+            "http_urls_targeted": len((self.results.get("web_content_discovery") or {}).get("urls_targeted") or []),
             "directory_scan_runs": len(dir_scans),
             "directory_interesting_hits": interesting_hits,
         }
+
+        self.results["evidence_package"] = build_evidence_package(
+            self.results, list(modules), lab_mode=self._rt is None
+        )
+        self.results["deterministic_findings"] = self.results["evidence_package"]["deterministic_findings"]
+        self.results["deterministic_attack_paths"] = self.results["evidence_package"]["deterministic_attack_paths"]
 
         self.results["recon_completed_utc"] = utc_now_iso()
         self.results["executive_snapshot"] = build_executive_snapshot(self.results)
@@ -896,11 +915,13 @@ class ReconEngine:
         rprint(f"[bold green]{escape('[+]')}[/bold green] [bold]Reconnaissance complete[/bold]")
         rprint(
             f"    [yellow]Subdomains:[/yellow] [white]{self.results['summary']['total_subdomains']}[/white]  "
-            f"[yellow]Open ports:[/yellow] [white]{self.results['summary']['total_open_ports']}[/white]  "
-            f"[yellow]Web services:[/yellow] [white]{self.results['summary']['web_services']}[/white]"
+            f"[yellow]Open TCP ports:[/yellow] [white]{self.results['summary']['total_open_ports']}[/white]  "
+            f"[yellow]HTTP(S) on ports:[/yellow] [white]{self.results['summary']['http_services_detected']}[/white]"
         )
         rprint(
-            f"    [yellow]DNS lookups:[/yellow] [white]{self.results['summary']['nslookup_runs']}[/white]  "
+            f"    [yellow]Subdomain HTTP probes w/ status:[/yellow] "
+            f"[white]{self.results['summary']['subdomain_http_probes_with_status']}[/white]  "
+            f"[yellow]DNS lookups:[/yellow] [white]{self.results['summary']['nslookup_runs']}[/white]  "
             f"[yellow]Directory scans:[/yellow] [white]{self.results['summary']['directory_scan_runs']}[/white]"
         )
         print_execution_recap(self.results, echo=echo_phases)

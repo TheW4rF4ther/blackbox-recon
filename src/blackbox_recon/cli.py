@@ -390,8 +390,26 @@ def recon_main(
             console.print(
                 "[dim]Timestamps and full command lines: JSON key `recon_phase_trace`.[/dim]"
             )
-        
-        # AI Analysis
+
+        det_findings = results.get("deterministic_findings") or []
+        if det_findings:
+            console.print("\n[bold green]Findings[/bold green] [dim](evidence-backed; see `evidence_package` in JSON)[/dim]")
+            ft = Table(box=box.ROUNDED, header_style="bold cyan")
+            ft.add_column("ID", style="dim", max_width=12)
+            ft.add_column("Code", style="yellow", max_width=14)
+            ft.add_column("Severity", style="magenta", max_width=11)
+            ft.add_column("Title", style="white", max_width=48, overflow="ellipsis")
+            ft.add_column("Evidence", style="dim", justify="right")
+            for row in det_findings[:12]:
+                eids = row.get("evidence_ids") or []
+                ft.add_row(
+                    str(row.get("id", ""))[:12],
+                    str(row.get("finding_code") or "—")[:14],
+                    str(row.get("severity", ""))[:11],
+                    (row.get("title") or "")[:200],
+                    str(len(eids)),
+                )
+            console.print(ft)
         if ai_mode != 'none':
             try:
                 api_key = cfg.get_api_key()
@@ -450,6 +468,8 @@ def recon_main(
                     'technical_analysis': analysis.technical_analysis,
                     'confidence_score': analysis.confidence_score,
                     'recommended_next_steps': analysis.recommended_next_steps,
+                    'attack_paths': analysis.attack_paths,
+                    'prioritized_findings': analysis.prioritized_findings,
                 }
 
                 if analysis.recommended_next_steps:
@@ -491,10 +511,12 @@ def recon_main(
         table.add_column("Count", style="bold white", justify="right")
         
         summary = results.get('summary', {})
-        table.add_row("Subdomains Found", str(summary.get('total_subdomains', 0)))
-        table.add_row("Open Ports", str(summary.get('total_open_ports', 0)))
-        table.add_row("Web Services", str(summary.get('web_services', 0)))
-        table.add_row("Technologies Detected", str(summary.get('total_tech_detected', 0)))
+        table.add_row("Subdomains found", str(summary.get('total_subdomains', 0)))
+        table.add_row("Open TCP ports", str(summary.get('open_tcp_ports', summary.get('total_open_ports', 0))))
+        table.add_row("HTTP(S) services (from ports)", str(summary.get('http_services_detected', 0)))
+        table.add_row("Subdomain HTTP probes w/ status", str(summary.get('subdomain_http_probes_with_status', summary.get('web_services', 0))))
+        table.add_row("HTTP URLs targeted (dir / content)", str(summary.get('http_urls_targeted', summary.get('web_urls_targeted', 0))))
+        table.add_row("Technology profiles stored", str(summary.get('technology_profiles_stored', summary.get('total_tech_detected', 0))))
         
         console.print(table)
         
@@ -704,12 +726,42 @@ def generate_markdown_report(results: dict, output_file: str):
 
         f.write("## Summary\n\n")
         summary = results.get("summary", {})
-        f.write(f"- **Subdomains Found:** {summary.get('total_subdomains', 0)}\n")
-        f.write(f"- **Open Ports:** {summary.get('total_open_ports', 0)}\n")
-        f.write(f"- **Web Services (subdomain HTTP):** {summary.get('web_services', 0)}\n")
+        f.write(f"- **Subdomains found:** {summary.get('total_subdomains', 0)}\n")
+        f.write(
+            f"- **Open TCP ports:** {summary.get('open_tcp_ports', summary.get('total_open_ports', 0))}\n"
+        )
+        f.write(f"- **HTTP(S) services (from ports):** {summary.get('http_services_detected', 0)}\n")
+        f.write(
+            f"- **Subdomain HTTP probes with status:** "
+            f"{summary.get('subdomain_http_probes_with_status', summary.get('web_services', 0))}\n"
+        )
+        f.write(
+            f"- **HTTP URLs targeted:** "
+            f"{summary.get('http_urls_targeted', summary.get('web_urls_targeted', 0))}\n"
+        )
+        f.write(
+            f"- **Technology profiles stored:** "
+            f"{summary.get('technology_profiles_stored', summary.get('total_tech_detected', 0))}\n"
+        )
         f.write(f"- **Nslookup runs:** {summary.get('nslookup_runs', 0)}\n")
         f.write(f"- **Directory scan runs:** {summary.get('directory_scan_runs', 0)}\n")
         f.write(f"- **Interesting directory hits:** {summary.get('directory_interesting_hits', 0)}\n\n")
+
+        det = results.get("deterministic_findings") or []
+        if det:
+            f.write("## Findings (evidence-backed)\n\n")
+            f.write("| ID | Code | Severity | Status | Title | Evidence IDs |\n")
+            f.write("|----|------|----------|--------|-------|---------------|\n")
+            for row in det[:25]:
+                eids = ", ".join(row.get("evidence_ids") or [])
+                if len(eids) > 80:
+                    eids = eids[:77] + "..."
+                title = str(row.get("title", "")).replace("|", "\\|")
+                f.write(
+                    f"| `{row.get('id', '')}` | `{row.get('finding_code') or ''}` | "
+                    f"{row.get('severity', '')} | {row.get('status', '')} | {title} | {eids} |\n"
+                )
+            f.write("\n")
 
         dns = results.get("dns_intelligence") or {}
         lookups = dns.get("nslookups") or []

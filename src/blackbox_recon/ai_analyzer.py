@@ -693,7 +693,12 @@ def check_ollama_connection(base_url: str, timeout: float = 10.0) -> str:
 
 @dataclass
 class AnalysisResult:
-    """Result from AI analysis."""
+    """Result from AI analysis layered on recon output.
+
+    ``attack_paths`` and ``prioritized_findings`` are populated from the engine's
+    deterministic, evidence-backed structures when present; the LLM supplies narrative
+    enrichment only (``executive_summary``, ``technical_analysis``, ``recommended_next_steps``).
+    """
 
     attack_paths: List[Dict[str, Any]]
     prioritized_findings: List[Dict[str, Any]]
@@ -986,9 +991,11 @@ Be specific, actionable, and focus on what a penetration tester should prioritiz
 
         exec_src = narrative or ""
         executive = exec_src[:500] if len(exec_src) > 500 else exec_src
+        atk = list(recon_data.get("deterministic_attack_paths") or [])
+        pri = list(recon_data.get("deterministic_findings") or [])
         return AnalysisResult(
-            attack_paths=[],
-            prioritized_findings=[],
+            attack_paths=atk,
+            prioritized_findings=pri,
             correlations=[],
             executive_summary=executive,
             technical_analysis=narrative,

@@ -69,6 +69,10 @@ def build_executive_snapshot(results: Dict[str, Any]) -> Dict[str, Any]:
         "target": results.get("target"),
         "recon_completed_utc": results.get("recon_completed_utc"),
         "open_port_count": summary.get("total_open_ports", len(ports)),
+        "http_services_detected": summary.get("http_services_detected", 0),
+        "subdomain_http_probes_with_status": summary.get(
+            "subdomain_http_probes_with_status", summary.get("web_services", 0)
+        ),
         "web_url_candidates": summary.get("web_urls_targeted", 0),
         "dns_names_observed": names[:25],
         "notable_paths_from_bruteforce": interesting_paths[:25],
