@@ -8,57 +8,44 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
-# Match ai_analyzer: strip Qwen-style think spans before JSON extract / quality gate.
-_THINK_OPEN, _THINK_CLOSE = "<think>", "</think>"
-_THINK_SPAN_RE = re.compile(
-    re.escape(_THINK_OPEN) + r"[\s\S]*?" + re.escape(_THINK_CLOSE),
-    re.IGNORECASE,
-)
+_THINK_SPAN_RE = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
 
 
 def strip_think_spans(text: str) -> str:
     return _THINK_SPAN_RE.sub("", (text or "")).strip()
 
 
-_BAD_AI_PATTERN_STRS = [
-    r"\bI need to\b",
-    r"\bI should\b",
-    r"\bI will\b",
-    r"\bLet's\b",
-    r"\bWait,\b",
-    r"\bActually,\b",
-    r"\bDraft\b",
-    r"\bRefine\b",
-    r"\bThinking\b",
-    r"\bchain of thought\b",
-    r"\bthe prompt\b",
-    r"\bformat\b",
-    r"\bmust be\b",
-    r"\bLet's stick\b",
-    r"\bLet's refine\b",
-    r"\bframe risks\b",
+BAD_AI_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"\bI need to\b",
+        r"\bI should\b",
+        r"\bLet's\b",
+        r"\bWait,\b",
+        r"\bActually,\b",
+        r"\bDraft\b",
+        r"\bRefine\b",
+        r"\bThinking\b",
+        r"\bchain of thought\b",
+        r"\breasoning process\b",
+        r"\bthe prompt\b",
+    ]
 ]
-BAD_AI_PATTERNS = [re.compile(p, re.IGNORECASE) for p in _BAD_AI_PATTERN_STRS]
 
 
 JSON_ENRICHMENT_SYSTEM_PROMPT = (
-    "Return valid JSON only. You are Blackbox Recon Analyst. "
-    "Use only the provided compact evidence package. "
-    "deterministic_findings are authoritative: do not invent findings, CVEs, hosts, paths, services, or exploitability. "
-    "No chain-of-thought, drafts, markdown, prose, exploit steps, payloads, or credential attacks."
+    "/no_think\n"
+    "You are Blackbox Recon Analyst. Return one compact valid JSON object only. "
+    "No reasoning. No markdown. No prose outside JSON. No drafts. "
+    "Use only the provided evidence. Do not invent CVEs, hosts, paths, services, or exploitability."
 )
 
 
 LOCAL_JSON_ENRICHMENT_PROMPT = """
-Return JSON only with exact keys:
-{
-  "executive_summary":"Two client-ready sentences maximum.",
-  "risk_narrative":[{"finding_id":"DET-FIND-001","client_ready_text":"One concise paragraph using only evidence.","confidence_note":"Short uncertainty note."}],
-  "cve_assessment":{"summary":"CVE status from evidence only.","confirmed_cves":[],"candidate_cves":[],"reasoning_limits":[]},
-  "recommended_next_steps":[{"tool":"name","objective":"why","prerequisite":"scope condition","example_cli":"command with TARGET_IP/HOST placeholders","risk_notes":"ROE note"}],
-  "quality_flags":[{"type":"coverage_gap","message":"Short factual note."}]
-}
-Use deterministic_findings as authoritative. Do not create new findings or change severity/status/evidence IDs. Max 5 next steps.
+/no_think
+Return ONLY minified JSON using this schema:
+{"executive_summary":"max 2 sentences","risk_narrative":[{"finding_id":"DET-FIND-001","client_ready_text":"1 short sentence","confidence_note":"short note"}],"cve_assessment":{"summary":"short","confirmed_cves":[],"candidate_cves":[],"reasoning_limits":[]},"recommended_next_steps":[{"tool":"tool","objective":"short","prerequisite":"short","example_cli":"tool TARGET","risk_notes":"short"}],"quality_flags":[{"type":"coverage_gap","message":"short"}]}
+Limits: risk_narrative max 3 items, recommended_next_steps max 4 items, every string under 180 chars. Use deterministic_findings only.
 """.strip()
 
 
@@ -114,13 +101,11 @@ def ai_output_fails_quality_gate(text: str) -> bool:
 
 
 def extract_json_object(text: str) -> Optional[str]:
-    """Extract a JSON object from model output (handles occasional fences or prefix junk)."""
     t = strip_think_spans(text or "")
     if not t:
         return None
-    if "```" in t:
-        t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE).strip()
-        t = re.sub(r"\s*```\s*$", "", t).strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE).strip()
+    t = re.sub(r"\s*```\s*$", "", t).strip()
     start = t.find("{")
     end = t.rfind("}")
     if start == -1 or end <= start:
@@ -140,124 +125,83 @@ def parse_ai_enrichment_json(raw: str) -> Tuple[Optional[Dict[str, Any]], Option
         model = AiEnrichmentResponse.model_validate(data)
     except Exception as e:
         return None, f"pydantic:{e}"
-    return model.model_dump(), None
+    out = model.model_dump()
+    out["risk_narrative"] = out.get("risk_narrative", [])[:3]
+    out["recommended_next_steps"] = out.get("recommended_next_steps", [])[:4]
+    out["quality_flags"] = out.get("quality_flags", [])[:4]
+    return out, None
 
 
-def _shorten(value: Any, max_len: int = 220) -> Any:
+def _shorten(value: Any, max_len: int = 160) -> Any:
     if isinstance(value, str):
         v = " ".join(value.split())
         return v[: max_len - 3] + "..." if len(v) > max_len else v
+    if isinstance(value, list):
+        return value[:6]
+    if isinstance(value, dict):
+        return {str(k)[:40]: _shorten(v, 120) for k, v in list(value.items())[:6]}
     return value
 
 
-def evidence_package_dict_for_llm(recon_data: Dict[str, Any], *, max_evidence: int = 12) -> Dict[str, Any]:
-    """Return a compact package suitable for small local models.
-
-    Qwen 9B deployments in LM Studio often run with 4096-token context. Avoid
-    raw stdout, banners, TLS excerpts, and full evidence bodies; keep only the
-    authoritative findings, metrics, coverage notes, and a small evidence index.
-    """
+def evidence_package_dict_for_llm(recon_data: Dict[str, Any], *, max_evidence: int = 4, max_findings: int = 8) -> Dict[str, Any]:
+    """Return an ultra-compact package for 4K-context local reasoning models."""
     pkg = recon_data.get("evidence_package")
     if not isinstance(pkg, dict) or not pkg.get("deterministic_findings"):
         from .evidence import build_evidence_package
-
         eng = recon_data.get("engagement") or {}
         mods = list(eng.get("modules_requested") or ["subdomain", "portscan", "technology"])
         lab_mode = not bool(eng.get("record"))
         pkg = build_evidence_package(recon_data, mods, lab_mode=lab_mode)
 
     findings = []
-    for f in list(pkg.get("deterministic_findings") or [])[:12]:
-        if not isinstance(f, dict):
-            continue
-        findings.append(
-            {
-                "id": f.get("id"),
-                "code": f.get("finding_code"),
-                "severity": f.get("severity"),
-                "status": f.get("status"),
-                "title": _shorten(f.get("title"), 120),
-                "assets": list(f.get("affected_assets") or [])[:4],
-                "evidence_ids": list(f.get("evidence_ids") or [])[:6],
-                "impact": _shorten(f.get("impact"), 220),
-                "recommendation": _shorten(f.get("recommendation"), 220),
-            }
-        )
+    for f in list(pkg.get("deterministic_findings") or [])[:max_findings]:
+        if isinstance(f, dict):
+            findings.append(
+                {
+                    "id": f.get("id"),
+                    "code": f.get("finding_code"),
+                    "sev": f.get("severity"),
+                    "title": _shorten(f.get("title"), 90),
+                    "assets": list(f.get("affected_assets") or [])[:2],
+                    "evidence_ids": list(f.get("evidence_ids") or [])[:3],
+                }
+            )
 
     evidence_index = []
     for e in list(pkg.get("evidence") or [])[:max_evidence]:
         if not isinstance(e, dict):
             continue
         observed = e.get("observed_value") or {}
-        compact_observed = {}
+        compact = {}
         if isinstance(observed, dict):
-            for k in (
-                "state",
-                "service",
-                "version",
-                "status_code",
-                "final_url",
-                "missing_security_headers",
-                "disclosure_headers",
-                "supported_protocols",
-                "weak_signals",
-                "target_type",
-                "interesting_paths_found",
-            ):
-                if k in observed and observed.get(k) not in (None, "", [], {}):
-                    compact_observed[k] = _shorten(observed.get(k), 180)
-        evidence_index.append(
-            {
-                "id": e.get("id"),
-                "phase": e.get("phase_id"),
-                "type": e.get("observation_type"),
-                "asset": _shorten(e.get("asset"), 160),
-                "confidence": e.get("confidence"),
-                "observed": compact_observed,
-            }
-        )
+            for k in ("service", "version", "status_code", "missing_security_headers", "supported_protocols", "weak_signals", "target_type"):
+                if observed.get(k) not in (None, "", [], {}):
+                    compact[k] = _shorten(observed.get(k), 100)
+        evidence_index.append({"id": e.get("id"), "phase": e.get("phase_id"), "type": e.get("observation_type"), "asset": _shorten(e.get("asset"), 90), "observed": compact})
 
-    summary = ((pkg.get("assessment") or {}).get("summary_metrics") or {})
+    assessment = pkg.get("assessment") or {}
+    summary = assessment.get("summary_metrics") or {}
     return {
-        "schema_version": pkg.get("schema_version", "1.0"),
-        "assessment": {
-            "target": ((pkg.get("assessment") or {}).get("target")),
-            "mode": ((pkg.get("assessment") or {}).get("mode")),
-            "summary_metrics": summary,
-        },
-        "deterministic_findings": findings,
-        "deterministic_attack_paths": list(pkg.get("deterministic_attack_paths") or [])[:3],
-        "coverage_notes": list(pkg.get("coverage_notes") or [])[:6],
+        "target": assessment.get("target"),
+        "mode": assessment.get("mode"),
+        "metrics": summary,
+        "findings": findings,
+        "coverage_notes": list(pkg.get("coverage_notes") or [])[:4],
         "evidence_index": evidence_index,
-        "_compact_for_local_llm": True,
     }
 
 
-def evidence_package_json_for_llm(recon_data: Dict[str, Any], max_chars: int = 5200) -> str:
-    pkg = evidence_package_dict_for_llm(recon_data)
-    text = json.dumps(pkg, separators=(",", ":"), ensure_ascii=False)
-    if len(text) <= max_chars:
-        return text
-    for n in (8, 5, 3, 0):
-        pkg2 = evidence_package_dict_for_llm(recon_data, max_evidence=n)
-        text = json.dumps(pkg2, separators=(",", ":"), ensure_ascii=False)
+def evidence_package_json_for_llm(recon_data: Dict[str, Any], max_chars: int = 2600) -> str:
+    for max_findings, max_evidence in ((8, 4), (6, 2), (4, 0)):
+        pkg = evidence_package_dict_for_llm(recon_data, max_evidence=max_evidence, max_findings=max_findings)
+        text = json.dumps(pkg, separators=(",", ":"), ensure_ascii=False)
         if len(text) <= max_chars:
             return text
-    return json.dumps(
-        {
-            "schema_version": pkg.get("schema_version", "1.0"),
-            "assessment": pkg.get("assessment") or {},
-            "deterministic_findings": (pkg.get("deterministic_findings") or [])[:8],
-            "coverage_notes": pkg.get("coverage_notes") or [],
-            "_truncated": True,
-        },
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
+    pkg = evidence_package_dict_for_llm(recon_data, max_evidence=0, max_findings=3)
+    return json.dumps(pkg, separators=(",", ":"), ensure_ascii=False)[:max_chars]
 
 
 def format_enrichment_markdown(enrichment: Dict[str, Any]) -> str:
-    """Client-safe markdown block from validated JSON enrichment."""
     parts: List[str] = []
     ex = (enrichment.get("executive_summary") or "").strip()
     if ex:
@@ -265,48 +209,40 @@ def format_enrichment_markdown(enrichment: Dict[str, Any]) -> str:
     rn = enrichment.get("risk_narrative") or []
     if rn:
         parts.append("### Risk narrative (by finding)\n\n")
-        for item in rn:
+        for item in rn[:3]:
             if not isinstance(item, dict):
                 continue
             fid = item.get("finding_id", "")
             body = (item.get("client_ready_text") or "").strip()
             note = (item.get("confidence_note") or "").strip()
-            if not body:
-                continue
-            parts.append(f"**{fid}**  \n{body}\n")
+            if body:
+                parts.append(f"**{fid}**  \n{body}\n")
             if note:
                 parts.append(f"*Evidence note:* {note}\n\n")
     cve = enrichment.get("cve_assessment") or {}
-    if isinstance(cve, dict) and (cve.get("summary") or cve.get("reasoning_limits")):
-        parts.append("### CVE assessment (enrichment)\n\n")
-        if cve.get("summary"):
-            parts.append(str(cve["summary"]) + "\n\n")
-        for lim in cve.get("reasoning_limits") or []:
-            parts.append(f"- {lim}\n")
-        parts.append("\n")
+    if isinstance(cve, dict) and cve.get("summary"):
+        parts.append("### CVE assessment (enrichment)\n\n" + str(cve.get("summary")) + "\n")
     qf = enrichment.get("quality_flags") or []
     if qf:
         parts.append("### Quality flags\n\n")
-        for q in qf:
+        for q in qf[:4]:
             if isinstance(q, dict) and q.get("message"):
                 parts.append(f"- **{q.get('type', 'note')}:** {q['message']}\n")
-        parts.append("\n")
     return "\n".join(parts).strip()
 
 
 def next_steps_to_legacy_list(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Map JSON next steps to the existing ``recommended_next_steps`` row shape."""
     out: List[Dict[str, Any]] = []
-    for s in steps[:8]:
+    for s in steps[:4]:
         if not isinstance(s, dict):
             continue
         out.append(
             {
-                "tool": str(s.get("tool", "")).strip()[:120],
-                "objective": str(s.get("objective", "")).strip()[:500],
-                "prerequisite": str(s.get("prerequisite", "")).strip()[:500],
-                "example_cli": str(s.get("example_cli", "")).strip()[:800],
-                "risk_notes": str(s.get("risk_notes", "")).strip()[:500],
+                "tool": str(s.get("tool", "")).strip()[:80],
+                "objective": str(s.get("objective", "")).strip()[:220],
+                "prerequisite": str(s.get("prerequisite", "")).strip()[:220],
+                "example_cli": str(s.get("example_cli", "")).strip()[:220],
+                "risk_notes": str(s.get("risk_notes", "")).strip()[:220],
             }
         )
     return [r for r in out if r.get("tool")]
