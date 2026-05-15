@@ -6,6 +6,10 @@ __email__ = "info@blackboxintelgroup.com"
 __license__ = "MIT"
 
 from .recon import ReconEngine
+from .posture_enrichment import patch_recon_engine
+
+patch_recon_engine(ReconEngine)
+
 from .ai_analyzer import AIAnalyzer
 from .config import Config
 
