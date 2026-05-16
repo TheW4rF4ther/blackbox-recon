@@ -127,16 +127,11 @@ def _deterministic_local_fallback(recon_data: Dict[str, Any], *, reason: str) ->
                 "confidence_note": f"Status: {f.get('status', 'unknown')}; based only on deterministic Blackbox Recon evidence.",
             }
         )
-    steps = [
-        {"tool": "manual-review", "objective": "Review deterministic findings and evidence IDs", "prerequisite": "Authorized scope", "example_cli": "blackbox-recon --target TARGET --full --lab", "risk_notes": "Validate against ROE before follow-up."},
-        {"tool": "nmap", "objective": "Validate exposed service versions", "prerequisite": "Ports remain in scope", "example_cli": "nmap -sV -sC -p PORTS TARGET", "risk_notes": "Non-invasive validation only."},
-        {"tool": "whatweb", "objective": "Confirm web stack fingerprints", "prerequisite": "HTTP services in scope", "example_cli": "whatweb -a 3 http://TARGET/", "risk_notes": "Fingerprinting is advisory, not proof of vulnerability."},
-    ]
     enrichment = {
-        "executive_summary": f"Blackbox Recon completed evidence-backed reconnaissance for {target}. Local AI enrichment was unavailable, so this section is deterministic fallback text generated from validated findings.",
+        "executive_summary": f"Blackbox Recon completed evidence-backed reconnaissance for {target}. Local AI enrichment was unavailable, so deterministic scanner output remains authoritative.",
         "risk_narrative": narrative,
         "cve_assessment": {"summary": "No CVEs were confirmed from the collected evidence alone.", "confirmed_cves": [], "candidate_cves": [], "reasoning_limits": ["Precise product versions or authenticated configuration data may be required for confident CVE mapping."]},
-        "recommended_next_steps": steps,
+        "recommended_next_steps": [],
         "quality_flags": [
             {"type": "ai_provider_fallback", "message": reason[:180]},
             {"type": "coverage_note", "message": f"Open ports: {summary.get('total_open_ports', summary.get('open_tcp_ports', 0))}; HTTP services: {summary.get('http_services_detected', 0)}."},
@@ -270,7 +265,6 @@ class AIAnalyzer:
 
     def analyze_recon_data(self, recon_data: Dict[str, Any], *, show_ai_narrative: bool = False, save_ai_raw: bool = False) -> AnalysisResult:
         from .ai_json_enrichment import LOCAL_JSON_ENRICHMENT_PROMPT, ai_output_fails_quality_gate, format_enrichment_markdown, next_steps_to_legacy_list, parse_ai_enrichment_json, strip_think_spans
-        rprint(f"[bold cyan]{escape('[AI]')}[/bold cyan] Analyzing attack surface with [yellow]{escape(self.provider_name)}[/yellow]…")
         atk = list(recon_data.get("deterministic_attack_paths") or [])
         pri = list(recon_data.get("deterministic_findings") or [])
         if self.provider_name in ("local", "ollama"):
@@ -280,19 +274,21 @@ class AIAnalyzer:
             if (raw_analysis or "").strip().startswith("Error"):
                 enrichment = _deterministic_local_fallback(recon_data, reason=str(raw_analysis or "local provider returned no usable content"))
                 md = format_enrichment_markdown(enrichment)
-                return AnalysisResult(attack_paths=atk, prioritized_findings=pri, executive_summary=enrichment["executive_summary"], technical_analysis=(md if show_ai_narrative else "AI provider produced no usable content; deterministic enrichment fallback applied."), confidence_score=0.75, recommended_next_steps=next_steps_to_legacy_list(enrichment.get("recommended_next_steps") or []), ai_status="fallback_deterministic", ai_discard_reason="provider_empty_or_error", ai_enrichment=enrichment, raw_llm_text=raw_llm_text)
+                return AnalysisResult(attack_paths=atk, prioritized_findings=pri, executive_summary=enrichment["executive_summary"], technical_analysis=(md if show_ai_narrative else ""), confidence_score=0.75, recommended_next_steps=[], ai_status="fallback_deterministic", ai_discard_reason="provider_empty_or_error", ai_enrichment=enrichment, raw_llm_text=raw_llm_text)
             enrichment, err = parse_ai_enrichment_json(clean)
             if enrichment:
                 md = format_enrichment_markdown(enrichment)
                 if ai_output_fails_quality_gate(md):
                     enrichment = _deterministic_local_fallback(recon_data, reason="parsed model output failed quality gate")
                     md = format_enrichment_markdown(enrichment)
-                    return AnalysisResult(attack_paths=atk, prioritized_findings=pri, executive_summary=enrichment["executive_summary"], technical_analysis=(md if show_ai_narrative else "AI output failed quality checks; deterministic enrichment fallback applied."), confidence_score=0.75, recommended_next_steps=next_steps_to_legacy_list(enrichment.get("recommended_next_steps") or []), ai_status="fallback_deterministic", ai_discard_reason="rendered_quality_gate", ai_enrichment=enrichment, raw_llm_text=raw_llm_text)
+                    return AnalysisResult(attack_paths=atk, prioritized_findings=pri, executive_summary=enrichment["executive_summary"], technical_analysis=(md if show_ai_narrative else ""), confidence_score=0.75, recommended_next_steps=[], ai_status="fallback_deterministic", ai_discard_reason="rendered_quality_gate", ai_enrichment=enrichment, raw_llm_text=raw_llm_text)
+                rprint(f"[bold cyan]{escape('[AI]')}[/bold cyan] Applied [yellow]{escape(self.provider_name)}[/yellow] enrichment.")
                 return AnalysisResult(attack_paths=atk, prioritized_findings=pri, executive_summary=(enrichment.get("executive_summary") or "")[:500], technical_analysis=(md if show_ai_narrative else ""), confidence_score=0.85, recommended_next_steps=next_steps_to_legacy_list(enrichment.get("recommended_next_steps") or []), ai_status="applied", ai_enrichment=enrichment, raw_llm_text=raw_llm_text)
             enrichment = _deterministic_local_fallback(recon_data, reason=f"model output parse failed: {err}")
             md = format_enrichment_markdown(enrichment)
-            return AnalysisResult(attack_paths=atk, prioritized_findings=pri, executive_summary=enrichment["executive_summary"], technical_analysis=(md if show_ai_narrative else "AI output could not be parsed; deterministic enrichment fallback applied."), confidence_score=0.75, recommended_next_steps=next_steps_to_legacy_list(enrichment.get("recommended_next_steps") or []), ai_status="fallback_deterministic", ai_discard_reason=err, ai_enrichment=enrichment, raw_llm_text=raw_llm_text)
+            return AnalysisResult(attack_paths=atk, prioritized_findings=pri, executive_summary=enrichment["executive_summary"], technical_analysis=(md if show_ai_narrative else ""), confidence_score=0.75, recommended_next_steps=[], ai_status="fallback_deterministic", ai_discard_reason=err, ai_enrichment=enrichment, raw_llm_text=raw_llm_text)
 
+        rprint(f"[bold cyan]{escape('[AI]')}[/bold cyan] Analyzing attack surface with [yellow]{escape(self.provider_name)}[/yellow]…")
         raw_analysis = self.provider.analyze(recon_data, self.ANALYSIS_PROMPT, strict_json_evidence=False)
         steps: List[Dict[str, Any]] = []
         narrative = raw_analysis
