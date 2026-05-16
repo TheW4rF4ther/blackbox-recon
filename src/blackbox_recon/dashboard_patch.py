@@ -49,13 +49,20 @@ _NOISY_RECON_TOKENS = (
     "Subdomains:",
     "Open TCP ports:",
     "HTTP header URLs:",
-    "Running nslookup",
-    "Enumerating subdomains",
+)
+
+_CORE_PROGRESS_TOKENS = (
     "Found 0 valid subdomains",
+    "Found ",
     "Default port scan:",
     "nmap aggressive scan",
+    "Scanning ",
+    "Running nmap -sV",
+    "Found ",
+    "open ports on",
+    "Probing services",
     "Web content discovery on",
-    "feroxbuster:",
+    "Running nslookup",
 )
 
 _PROGRESS_PHASES = (
@@ -72,6 +79,8 @@ _PROGRESS_PHASES = (
 
 def _is_noisy_recon_text(text: str) -> bool:
     stripped = (text or "").strip()
+    if any(tok in text for tok in _CORE_PROGRESS_TOKENS):
+        return False
     return any(tok in text for tok in _NOISY_RECON_TOKENS) or stripped.startswith("─") or stripped.startswith("·") or stripped.startswith("→") or stripped.startswith("====")
 
 
@@ -157,7 +166,7 @@ def _install_default_phase_suppressor() -> None:
             "Recon progress:",
             "Core scan",
         )
-        if any(tok in text for tok in keep_tokens):
+        if any(tok in text for tok in keep_tokens) or any(tok in text for tok in _CORE_PROGRESS_TOKENS):
             return original_print(*objects, **kwargs)
         if _is_noisy_recon_text(text):
             return
