@@ -1,4 +1,4 @@
-"""Strict JSON enrichment for local/Ollama models using normalized tool results."""
+"""Strict JSON enrichment for AI models using service-centric assessments."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ BAD_AI_PATTERNS = [
         r"\bchain of thought\b",
         r"\breasoning process\b",
         r"\bthe prompt\b",
+        r"TOOL-\d+",
     ]
 ]
 
@@ -36,8 +37,9 @@ BAD_AI_PATTERNS = [
 JSON_ENRICHMENT_SYSTEM_PROMPT = (
     "/no_think\n"
     "You are Blackbox Recon Analyst. Return one compact valid JSON object only. "
-    "Analyze only the normalized tool_results provided by the scanner. "
-    "No reasoning. No markdown. No prose outside JSON. No drafts. "
+    "Analyze only the service_assessments provided by the scanner. "
+    "Speak in service terms such as SSH, HTTP, HTTPS, TLS, SMB, FTP, SMTP, and RDP. "
+    "Do not mention TOOL IDs. No reasoning. No markdown. No prose outside JSON. "
     "Do not invent CVEs, hosts, paths, services, vulnerabilities, or exploitability."
 )
 
@@ -45,8 +47,8 @@ JSON_ENRICHMENT_SYSTEM_PROMPT = (
 LOCAL_JSON_ENRICHMENT_PROMPT = """
 /no_think
 Return ONLY minified JSON using this schema:
-{"executive_summary":"max 2 sentences","risk_narrative":[{"finding_id":"TOOL-001","client_ready_text":"1 short sentence based on tool output","confidence_note":"short note"}],"cve_assessment":{"summary":"short","confirmed_cves":[],"candidate_cves":[],"reasoning_limits":[]},"recommended_next_steps":[{"tool":"tool","objective":"specific validation goal","prerequisite":"short","example_cli":"tool TARGET","risk_notes":"short"}],"quality_flags":[{"type":"coverage_gap","message":"short"}]}
-Rules: use only tool_results and vulnerability_signals. Max 3 risk_narrative items, max 4 next steps, every string under 180 chars.
+{"executive_summary":"max 2 sentences","risk_narrative":[{"finding_id":"SSH|HTTP|HTTPS|TLS|SMB|FTP|SMTP|RDP|SCOPE","client_ready_text":"1 short sentence based on service assessment","confidence_note":"short evidence/limitation note"}],"cve_assessment":{"summary":"short","confirmed_cves":[],"candidate_cves":[],"reasoning_limits":[]},"recommended_next_steps":[{"tool":"tool or method","objective":"specific validation goal","prerequisite":"short","example_cli":"tool TARGET","risk_notes":"short"}],"quality_flags":[{"type":"coverage_gap|no_confirmed_findings|evidence_limit","message":"short"}]}
+Rules: use only service_assessments, candidate_findings, negative_results, verification_targets, and limitations. Never mention TOOL IDs. Max 4 risk_narrative items, max 4 next steps, every string under 180 chars.
 """.strip()
 
 
@@ -127,7 +129,7 @@ def parse_ai_enrichment_json(raw: str) -> Tuple[Optional[Dict[str, Any]], Option
     except Exception as e:
         return None, f"pydantic:{e}"
     out = model.model_dump()
-    out["risk_narrative"] = out.get("risk_narrative", [])[:3]
+    out["risk_narrative"] = out.get("risk_narrative", [])[:4]
     out["recommended_next_steps"] = out.get("recommended_next_steps", [])[:4]
     out["quality_flags"] = out.get("quality_flags", [])[:4]
     return out, None
@@ -144,72 +146,55 @@ def _shorten(value: Any, max_len: int = 180) -> Any:
     return value
 
 
-def tool_results_dict_for_llm(recon_data: Dict[str, Any], *, max_tools: int = 10) -> Dict[str, Any]:
-    """Return an ultra-compact package built from normalized tool_results."""
-    from .tool_results import build_tool_results
+def service_assessments_dict_for_llm(recon_data: Dict[str, Any], *, max_services: int = 12) -> Dict[str, Any]:
+    """Return compact service-centric package for AI enrichment."""
+    from .service_assessment import build_service_assessments
 
-    raw_tools = build_tool_results(recon_data)
-    tools: List[Dict[str, Any]] = []
-    for t in raw_tools[:max_tools]:
-        if not isinstance(t, dict):
+    assessment = build_service_assessments(recon_data)
+    services: List[Dict[str, Any]] = []
+    for svc in (assessment.get("assessments") or [])[:max_services]:
+        if not isinstance(svc, dict):
             continue
-        tools.append(
+        services.append(
             {
-                "id": t.get("id"),
-                "tool": t.get("tool"),
-                "purpose": _shorten(t.get("purpose"), 110),
-                "status": t.get("status"),
-                "assets": list(t.get("assets") or [])[:4],
-                "important_output": [_shorten(x, 170) for x in list(t.get("important_output") or [])[:6]],
-                "signals": [_shorten(x, 90) for x in list(t.get("signals") or [])[:6]],
+                "service": svc.get("service"),
+                "asset": f"{svc.get('host')}:{svc.get('port')}",
+                "observed": [_shorten(x, 150) for x in (svc.get("observed") or [])[:4]],
+                "candidate_findings": [_shorten(x, 180) for x in (svc.get("candidate_findings") or [])[:4]],
+                "negative_results": [_shorten(x, 150) for x in (svc.get("negative_results") or [])[:4]],
+                "operator_notes": [_shorten(x, 160) for x in (svc.get("operator_notes") or [])[:3]],
+                "verification_targets": [_shorten(x, 150) for x in (svc.get("verification_targets") or [])[:4]],
             }
         )
-
-    findings = []
-    for f in list(recon_data.get("deterministic_findings") or [])[:8]:
-        if not isinstance(f, dict):
-            continue
-        code = str(f.get("finding_code") or "")
-        # Keep signals that are not just obvious exposure restatements.
-        if code.startswith("BBR-EXPOSURE"):
-            continue
-        findings.append(
-            {
-                "id": f.get("id"),
-                "code": code,
-                "severity": f.get("severity"),
-                "title": _shorten(f.get("title"), 110),
-                "assets": list(f.get("affected_assets") or [])[:3],
-            }
-        )
-
-    summary = recon_data.get("summary") or {}
     return {
-        "target": recon_data.get("target"),
-        "summary": {
-            "open_ports": summary.get("total_open_ports", summary.get("open_tcp_ports", 0)),
-            "http_services": summary.get("http_services_detected", 0),
-            "content_hits": summary.get("interesting_paths_found", 0),
-            "tools": len(raw_tools),
-        },
-        "tool_results": tools,
-        "vulnerability_signals": findings,
-        "instruction": "Recommend technical validation paths only from these tool_results. If evidence is insufficient, say so.",
+        "target": assessment.get("target"),
+        "target_type": assessment.get("target_type"),
+        "summary": assessment.get("summary") or {},
+        "limitations": [_shorten(x, 170) for x in (assessment.get("limitations") or [])[:5]],
+        "service_assessments": services,
+        "candidate_findings": [_shorten(x, 180) for x in (assessment.get("candidate_findings") or [])[:8]],
+        "negative_results": [_shorten(x, 170) for x in (assessment.get("negative_results") or [])[:8]],
+        "verification_targets": [_shorten(x, 170) for x in (assessment.get("verification_targets") or [])[:8]],
+        "instruction": "Return service-centric analyst notes. If evidence is insufficient, say no confirmed finding. Never mention TOOL IDs.",
     }
 
 
+def tool_results_dict_for_llm(recon_data: Dict[str, Any], *, max_tools: int = 10) -> Dict[str, Any]:
+    """Compatibility name; returns service assessments now."""
+    return service_assessments_dict_for_llm(recon_data, max_services=max_tools)
+
+
 def evidence_package_dict_for_llm(recon_data: Dict[str, Any], *, max_evidence: int = 4, max_findings: int = 8) -> Dict[str, Any]:
-    """Compatibility wrapper: AI now receives normalized tool_results, not evidence_package."""
-    return tool_results_dict_for_llm(recon_data)
+    return service_assessments_dict_for_llm(recon_data)
 
 
 def evidence_package_json_for_llm(recon_data: Dict[str, Any], max_chars: int = 3000) -> str:
-    for max_tools in (10, 8, 6, 4):
-        pkg = tool_results_dict_for_llm(recon_data, max_tools=max_tools)
+    for max_services in (12, 8, 6, 4):
+        pkg = service_assessments_dict_for_llm(recon_data, max_services=max_services)
         text = json.dumps(pkg, separators=(",", ":"), ensure_ascii=False)
         if len(text) <= max_chars:
             return text
-    pkg = tool_results_dict_for_llm(recon_data, max_tools=3)
+    pkg = service_assessments_dict_for_llm(recon_data, max_services=3)
     return json.dumps(pkg, separators=(",", ":"), ensure_ascii=False)[:max_chars]
 
 
@@ -217,14 +202,14 @@ def format_enrichment_markdown(enrichment: Dict[str, Any]) -> str:
     parts: List[str] = []
     ex = (enrichment.get("executive_summary") or "").strip()
     if ex:
-        parts.append("### Executive summary (enrichment)\n\n" + ex + "\n")
+        parts.append("### AI Analyst Summary\n\n" + ex + "\n")
     rn = enrichment.get("risk_narrative") or []
     if rn:
-        parts.append("### Risk narrative (by tool result)\n\n")
-        for item in rn[:3]:
+        parts.append("### Service-Centric Analyst Notes\n\n")
+        for item in rn[:4]:
             if not isinstance(item, dict):
                 continue
-            fid = item.get("finding_id", "")
+            fid = str(item.get("finding_id", "") or "Service").replace("TOOL-", "")
             body = (item.get("client_ready_text") or "").strip()
             note = (item.get("confidence_note") or "").strip()
             if body:
@@ -233,10 +218,10 @@ def format_enrichment_markdown(enrichment: Dict[str, Any]) -> str:
                 parts.append(f"*Evidence note:* {note}\n\n")
     cve = enrichment.get("cve_assessment") or {}
     if isinstance(cve, dict) and cve.get("summary"):
-        parts.append("### CVE assessment (enrichment)\n\n" + str(cve.get("summary")) + "\n")
+        parts.append("### CVE Assessment\n\n" + str(cve.get("summary")) + "\n")
     qf = enrichment.get("quality_flags") or []
     if qf:
-        parts.append("### Quality flags\n\n")
+        parts.append("### Quality Flags\n\n")
         for q in qf[:4]:
             if isinstance(q, dict) and q.get("message"):
                 parts.append(f"- **{q.get('type', 'note')}:** {q['message']}\n")
