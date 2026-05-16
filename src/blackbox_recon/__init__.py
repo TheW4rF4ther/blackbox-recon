@@ -25,6 +25,12 @@ BLACKBOX_RECON_BANNER_ART = r"""
                          BLACKBOX RECON
 """.strip("\n")
 
+from .service_enum_plus import patch_service_enum
+from .tls_plus import patch_tls_scan
+
+patch_service_enum()
+patch_tls_scan()
+
 from .recon import ReconEngine
 from .posture_enrichment import patch_recon_engine
 from .dashboard_patch import patch_operator_dashboard
