@@ -239,6 +239,7 @@ class AIAnalyzer:
             raw_analysis = self.provider.analyze(recon_data, LOCAL_JSON_ENRICHMENT_PROMPT, strict_json_evidence=True)
             raw_llm_text = (raw_analysis or "") if save_ai_raw else None
             clean = strip_think_spans(raw_analysis or "")
+            render_ai_notes = show_ai_narrative or self.provider_name in ("openai", "claude")
             if (raw_analysis or "").strip().startswith("Error"):
                 enrichment = _deterministic_local_fallback(recon_data, reason=str(raw_analysis or "provider returned no usable content"))
                 md = format_enrichment_markdown(enrichment)
@@ -251,7 +252,7 @@ class AIAnalyzer:
                     md = format_enrichment_markdown(enrichment)
                     return AnalysisResult(attack_paths=atk, prioritized_findings=pri, executive_summary=enrichment["executive_summary"], technical_analysis=(md if show_ai_narrative else ""), confidence_score=0.75, recommended_next_steps=[], ai_status="fallback_deterministic", ai_discard_reason="rendered_quality_gate", ai_enrichment=enrichment, raw_llm_text=raw_llm_text)
                 rprint(f"[bold cyan]{escape('[AI]')}[/bold cyan] Applied [yellow]{escape(self.provider_name)}[/yellow] enrichment.")
-                return AnalysisResult(attack_paths=atk, prioritized_findings=pri, executive_summary=(enrichment.get("executive_summary") or "")[:500], technical_analysis=(md if show_ai_narrative else ""), confidence_score=0.85, recommended_next_steps=next_steps_to_legacy_list(enrichment.get("recommended_next_steps") or []), ai_status="applied", ai_enrichment=enrichment, raw_llm_text=raw_llm_text)
+                return AnalysisResult(attack_paths=atk, prioritized_findings=pri, executive_summary=(enrichment.get("executive_summary") or "")[:500], technical_analysis=(md if render_ai_notes else ""), confidence_score=0.85, recommended_next_steps=next_steps_to_legacy_list(enrichment.get("recommended_next_steps") or []), ai_status="applied", ai_enrichment=enrichment, raw_llm_text=raw_llm_text)
             enrichment = _deterministic_local_fallback(recon_data, reason=f"model output parse failed: {err}")
             md = format_enrichment_markdown(enrichment)
             return AnalysisResult(attack_paths=atk, prioritized_findings=pri, executive_summary=enrichment["executive_summary"], technical_analysis=(md if show_ai_narrative else ""), confidence_score=0.75, recommended_next_steps=[], ai_status="fallback_deterministic", ai_discard_reason=err, ai_enrichment=enrichment, raw_llm_text=raw_llm_text)
