@@ -139,14 +139,7 @@ def _render_scan_snapshot(summary: Dict[str, Any], findings: List[Dict[str, Any]
     table.add_column("Content hits", justify="right", style="bold yellow")
     table.add_column("Findings", justify="right", style="bold yellow")
     table.add_column("Severity mix", style="bright_white")
-    table.add_row(
-        str(len(tool_results)),
-        str(summary.get("total_open_ports", summary.get("open_tcp_ports", 0))),
-        str(summary.get("http_services_detected", 0)),
-        str(summary.get("interesting_paths_found", 0)),
-        str(len(findings)),
-        ", ".join(f"{k}:{v}" for k, v in sorted(sev_counts.items())) or "none",
-    )
+    table.add_row(str(len(tool_results)), str(summary.get("total_open_ports", summary.get("open_tcp_ports", 0))), str(summary.get("http_services_detected", 0)), str(summary.get("interesting_paths_found", 0)), str(len(findings)), ", ".join(f"{k}:{v}" for k, v in sorted(sev_counts.items())) or "none")
     console.print(table)
 
 
@@ -161,13 +154,7 @@ def _render_open_ports(results: Dict[str, Any]) -> None:
     table.add_column("Version / banner", style="bright_white", overflow="fold")
     table.add_column("State", style="green", no_wrap=True)
     for port in ports[:30]:
-        table.add_row(
-            str(port.get("host") or ""),
-            str(port.get("port") or ""),
-            str(port.get("service") or "unknown"),
-            _short(port.get("version") or port.get("banner") or "-", 130),
-            str(port.get("state") or "open"),
-        )
+        table.add_row(str(port.get("host") or ""), str(port.get("port") or ""), str(port.get("service") or "unknown"), _short(port.get("version") or port.get("banner") or "-", 130), str(port.get("state") or "open"))
     console.print(table)
 
 
@@ -207,7 +194,15 @@ def _render_tool_results(tool_results: List[Dict[str, Any]]) -> None:
 def _render_vulnerability_signals(findings: List[Dict[str, Any]]) -> None:
     if not findings:
         return
-    useful = [f for f in findings if str(f.get("finding_code") or "").startswith(("BBR-WEB-HDR", "BBR-TLS", "BBR-SSH", "BBR-SMB", "BBR-FTP", "BBR-SMTP", "BBR-RDP"))]
+    useful = []
+    for f in findings:
+        code = str(f.get("finding_code") or "")
+        sev = str(f.get("severity") or "").lower()
+        title = str(f.get("title") or "").lower()
+        if sev == "informational" and ("tls service observed" in title or code.startswith("BBR-TLS-INFO")):
+            continue
+        if code.startswith(("BBR-WEB-HDR", "BBR-TLS-WEAK", "BBR-SSH", "BBR-SMB", "BBR-FTP", "BBR-SMTP", "BBR-RDP")):
+            useful.append(f)
     if not useful:
         return
     table = Table(title="Vulnerability Identification Signals", box=box.ROUNDED, header_style="bold cyan")
