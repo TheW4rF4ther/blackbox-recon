@@ -1,12 +1,13 @@
-"""Pentester-forward terminal output for Blackbox Recon.
+"""Service-centric terminal output for Blackbox Recon.
 
-Primary contract: tool used -> command -> pertinent output -> signals.
-After the tools, show technical verification targets only when they add value.
+The dashboard intentionally separates evidence, interpretation, negative results,
+verification targets, and artifacts. Raw tool output belongs in artifacts/JSON,
+not the normal operator terminal.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 from rich import box
 from rich.console import Console
@@ -14,6 +15,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from .service_assessment import build_service_assessments
 from .tool_results import build_tool_results
 
 console = Console()
@@ -22,6 +24,15 @@ console = Console()
 def _short(value: Any, n: int = 120) -> str:
     text = " ".join(str(value or "").split())
     return text if len(text) <= n else text[: n - 3] + "..."
+
+
+def _ports(results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [p for p in (results.get("ports") or []) if isinstance(p, dict)]
+
+
+def _service_sort_key(row: Dict[str, Any]) -> tuple:
+    order = {"SSH": 10, "HTTP": 20, "HTTPS": 21, "SMB": 30, "FTP": 40, "SMTP": 50, "RDP": 60}
+    return (order.get(str(row.get("service")), 99), int(row.get("port") or 0))
 
 
 def _sev_style(sev: str) -> str:
@@ -35,218 +46,183 @@ def _sev_style(sev: str) -> str:
     return "dim cyan"
 
 
-def _status_style(status: str) -> str:
-    status = (status or "").lower()
-    if status in ("ok", "completed", "confirmed", "applied"):
-        return "green"
-    if status in ("skipped", "not_observed", "not applicable"):
-        return "dim"
-    if "error" in status or "fail" in status:
-        return "red"
-    return "yellow"
-
-
-def _signal_badge(signal: str) -> str:
-    low = (signal or "").lower()
-    if "no weak signal" in low or "tls sampled" in low or "service script completed" in low:
-        return "[dim cyan][INFO][/dim cyan]"
-    if "ssh exposed" in low or "web service exposed" in low or "interesting paths found" in low:
-        return "[bold yellow][EXPOSURE][/bold yellow]"
-    if "weak" in low or "missing security headers" in low or "service disclosure" in low:
-        return "[bold red][SIGNAL][/bold red]"
-    if "no flagged" in low or "none observed" in low or "not captured" in low or "no useful" in low:
-        return "[dim][NEGATIVE][/dim]"
-    if "bare ip" in low or "coverage" in low or "screenshot not" in low:
-        return "[bold magenta][LIMITATION][/bold magenta]"
-    return "[dim cyan][INFO][/dim cyan]"
-
-
-def _is_low_signal(row: Dict[str, Any]) -> bool:
-    status = str(row.get("status") or "").lower()
-    signals = " ".join(map(str, row.get("signals") or [])).lower()
-    output = " ".join(map(str, row.get("important_output") or [])).lower()
-    if "error" in status or "fail" in status:
-        return False
-    if any(x in signals or x in output for x in ("ssh exposed", "web service exposed", "weak tls signal", "missing security headers", "service disclosure", "interesting paths found", "waf_signal", "service script completed")):
-        return False
-    return any(x in signals or x in output or x in status for x in ("no flagged", "0 interesting", "none observed", "not captured", "skipped", "no useful", "completed/no flagged"))
-
-
-def _findings(results: Dict[str, Any]) -> List[Dict[str, Any]]:
-    return [f for f in (results.get("deterministic_findings") or []) if isinstance(f, dict)]
-
-
-def _ports(results: Dict[str, Any]) -> List[Dict[str, Any]]:
-    return [p for p in (results.get("ports") or []) if isinstance(p, dict)]
-
-
-def _has_port(results: Dict[str, Any], port: int) -> bool:
-    return any(int(p.get("port") or 0) == port for p in _ports(results))
-
-
-def _finding_by_code(results: Dict[str, Any], code: str) -> List[Dict[str, Any]]:
-    return [f for f in _findings(results) if f.get("finding_code") == code]
-
-
-def _verification_targets(results: Dict[str, Any]) -> List[Tuple[str, str, str, str]]:
-    targets: List[Tuple[str, str, str, str]] = []
-    if _has_port(results, 22):
-        targets.append(("SSH", "22/tcp", "Auth methods, password policy, key-only enforcement, algorithm list", "ssh -o PreferredAuthentications=none -v USER@TARGET; review ssh2-enum-algos output"))
-    if _has_port(results, 80) or _has_port(results, 443):
-        targets.append(("HTTP/S", "80/443", "Hostname/vhost routing, app identity, default nginx, hidden content", "Re-run against scoped FQDN; add Host header/vhost discovery before vuln testing"))
-    if results.get("tls_analysis"):
-        targets.append(("TLS", "443/tcp", "Certificate CN/SAN/issuer/expiry, TLS versions, weak ciphers/protocols", "Use sslscan/testssl.sh against FQDN + IP; compare to client crypto standard"))
-    if _finding_by_code(results, "BBR-COVERAGE-001"):
-        targets.append(("Scope", "bare IP", "SNI/vhost/subdomain blindness", "Obtain apex domain or scoped hostname; repeat recon with DNS context"))
-    return targets[:6]
-
-
 def render_triage_dashboard(results: Dict[str, Any]) -> None:
-    target = results.get("target") or "target"
-    summary = results.get("summary") or {}
-    findings = _findings(results)
-    tool_results = build_tool_results(results)
+    assessment = build_service_assessments(results)
+    target = assessment.get("target") or results.get("target") or "target"
 
     console.print()
     console.print(
         Panel(
             Text.from_markup(
                 f"[bold bright_white]{target}[/bold bright_white]\n"
-                "Tool results first. AI analysis follows only after evidence collection."
+                "Service-first recon triage. Findings are evidence-bound; raw tool output is stored as artifacts."
             ),
-            title="[bold red]Blackbox Recon · Pentest Scanner Output[/bold red]",
-            border_style="red",
+            title="[bold #b45309]Blackbox Recon · Operator Assessment[/bold #b45309]",
+            border_style="#b45309",
             padding=(1, 2),
         )
     )
-    _render_scan_snapshot(summary, findings, tool_results)
-    _render_open_ports(results)
-    _render_tool_results(tool_results)
-    _render_vulnerability_signals(findings)
-    _render_verification_targets(results)
-    _render_tester_takeaway(results)
+    _render_scope(assessment)
+    _render_snapshot(assessment, results)
+    _render_attack_surface(results)
+    _render_service_assessments(assessment)
+    _render_candidate_findings(assessment)
+    _render_negative_results(assessment)
+    _render_verification_targets(assessment)
+    _render_artifacts(assessment)
+    _render_tester_takeaway(assessment)
 
 
-def _render_scan_snapshot(summary: Dict[str, Any], findings: List[Dict[str, Any]], tool_results: List[Dict[str, Any]]) -> None:
-    sev_counts: Dict[str, int] = {}
-    for f in findings:
-        sev = str(f.get("severity") or "unknown")
-        sev_counts[sev] = sev_counts.get(sev, 0) + 1
-    table = Table(title="Scan Snapshot", box=box.SIMPLE_HEAVY, header_style="bold cyan")
-    table.add_column("Tools", justify="right", style="bold yellow")
-    table.add_column("Open ports", justify="right", style="bold yellow")
-    table.add_column("Web", justify="right", style="bold yellow")
-    table.add_column("Content hits", justify="right", style="bold yellow")
-    table.add_column("Findings", justify="right", style="bold yellow")
-    table.add_column("Severity mix", style="bright_white")
-    table.add_row(str(len(tool_results)), str(summary.get("total_open_ports", summary.get("open_tcp_ports", 0))), str(summary.get("http_services_detected", 0)), str(summary.get("interesting_paths_found", 0)), str(len(findings)), ", ".join(f"{k}:{v}" for k, v in sorted(sev_counts.items())) or "none")
+def _render_scope(assessment: Dict[str, Any]) -> None:
+    limitations = assessment.get("limitations") or []
+    table = Table(title="Scope & Limitations", box=box.SIMPLE_HEAVY, header_style="bold cyan")
+    table.add_column("Target", style="bold white")
+    table.add_column("Type", style="cyan")
+    table.add_column("Material limitations", style="bright_white", overflow="fold")
+    table.add_row(str(assessment.get("target") or ""), str(assessment.get("target_type") or "unknown"), "\n".join(f"- {x}" for x in limitations) or "none observed")
     console.print(table)
 
 
-def _render_open_ports(results: Dict[str, Any]) -> None:
+def _render_snapshot(assessment: Dict[str, Any], results: Dict[str, Any]) -> None:
+    summary = results.get("summary") or {}
+    a_sum = assessment.get("summary") or {}
+    table = Table(title="Executive Recon Snapshot", box=box.SIMPLE_HEAVY, header_style="bold cyan")
+    table.add_column("Services", justify="right", style="bold yellow")
+    table.add_column("Open ports", justify="right", style="bold yellow")
+    table.add_column("Web", justify="right", style="bold yellow")
+    table.add_column("Content hits", justify="right", style="bold yellow")
+    table.add_column("Candidate findings", justify="right", style="bold yellow")
+    table.add_column("Artifacts", justify="right", style="bold yellow")
+    table.add_row(
+        str(a_sum.get("services", 0)),
+        str(summary.get("total_open_ports", summary.get("open_tcp_ports", len(_ports(results))))),
+        str(summary.get("http_services_detected", 0)),
+        str(summary.get("interesting_paths_found", 0)),
+        str(a_sum.get("candidate_findings", 0)),
+        str(a_sum.get("artifacts", 0)),
+    )
+    console.print(table)
+
+
+def _render_attack_surface(results: Dict[str, Any]) -> None:
     ports = _ports(results)
     if not ports:
         return
-    table = Table(title="Open Ports", box=box.ROUNDED, header_style="bold cyan")
+    table = Table(title="Attack Surface", box=box.ROUNDED, header_style="bold cyan")
     table.add_column("Host", style="white", no_wrap=True)
     table.add_column("Port", justify="right", style="bold yellow", no_wrap=True)
     table.add_column("Service", style="cyan", no_wrap=True)
     table.add_column("Version / banner", style="bright_white", overflow="fold")
-    table.add_column("State", style="green", no_wrap=True)
-    for port in ports[:30]:
-        table.add_row(str(port.get("host") or ""), str(port.get("port") or ""), str(port.get("service") or "unknown"), _short(port.get("version") or port.get("banner") or "-", 130), str(port.get("state") or "open"))
+    table.add_column("Exposure", style="yellow", overflow="fold")
+    for p in ports[:30]:
+        port = int(p.get("port") or 0)
+        svc = str(p.get("service") or "unknown")
+        exposure = "Remote admin" if port == 22 else "Web" if port in (80, 443, 8080, 8443) or svc.startswith("http") else "Network service"
+        table.add_row(str(p.get("host") or ""), str(port), svc, _short(p.get("version") or p.get("banner") or "-", 130), exposure)
     console.print(table)
 
 
-def _render_tool_results(tool_results: List[Dict[str, Any]]) -> None:
-    if not tool_results:
+def _render_service_assessments(assessment: Dict[str, Any]) -> None:
+    rows = sorted(assessment.get("assessments") or [], key=_service_sort_key)
+    if not rows:
         return
-    console.print("\n[bold cyan][+] Tool Results[/bold cyan]")
-    for row in tool_results:
-        title = f"{row.get('id')} · {row.get('tool')} · {row.get('purpose')}"
-        signals = row.get("signals") or []
-        outputs = row.get("important_output") or []
-        status = str(row.get("status") or "unknown")
-        if _is_low_signal(row):
-            first_output = _short(outputs[0] if outputs else "completed/no useful signal", 140)
-            badge = _signal_badge(", ".join(map(str, signals)) or first_output)
-            console.print(f"  {badge} [bold cyan]{row.get('tool')}[/bold cyan]: [{_status_style(status)}]{status}[/] · {first_output}")
-            continue
-
+    console.print("\n[bold cyan][+] Service Assessments[/bold cyan]")
+    for svc in rows:
         body = Text()
-        cmd = row.get("command") or "not recorded / internal helper"
-        body.append("Command: ", style="bold dim")
-        body.append(_short(cmd, 180) + "\n", style="dim")
-        body.append("Status: ", style="bold dim")
-        body.append(status + "\n", style=_status_style(status))
-        if outputs:
-            body.append("Pertinent output:\n", style="bold bright_white")
-            for item in outputs[:6]:
-                body.append(f"  - {_short(item, 190)}\n", style="bright_white")
-        if signals:
-            body.append("Signals:\n", style="bold dim")
-            for sig in signals[:8]:
-                body.append(f"  {_signal_badge(str(sig))} {_short(sig, 160)}\n")
-        border = "red" if _status_style(status) == "red" else "yellow" if signals else "cyan"
-        console.print(Panel(body, title=f"[bold cyan]{_short(title, 110)}[/bold cyan]", border_style=border, padding=(1, 2)))
+        observed = svc.get("observed") or []
+        negatives = svc.get("negative_results") or []
+        notes = svc.get("operator_notes") or []
+        candidates = svc.get("candidate_findings") or []
+        if observed:
+            body.append("Observed:\n", style="bold bright_white")
+            for item in observed[:5]:
+                body.append(f"  - {_short(item, 180)}\n", style="bright_white")
+        if candidates:
+            body.append("Candidate findings:\n", style="bold yellow")
+            for item in candidates[:4]:
+                body.append(f"  - {_short(item.get('title'), 120)}: {_short(item.get('evidence'), 160)}\n", style="yellow")
+        if negatives:
+            body.append("Negative / inconclusive results:\n", style="bold dim")
+            for item in negatives[:4]:
+                body.append(f"  - {_short(item, 180)}\n", style="dim")
+        if notes:
+            body.append("Operator interpretation:\n", style="bold cyan")
+            for item in notes[:3]:
+                body.append(f"  - {_short(item, 180)}\n", style="cyan")
+        title = f"{svc.get('service')} · {svc.get('host')}:{svc.get('port')}"
+        border = "yellow" if candidates else "cyan"
+        console.print(Panel(body, title=f"[bold white]{title}[/bold white]", border_style=border, padding=(1, 2)))
 
 
-def _render_vulnerability_signals(findings: List[Dict[str, Any]]) -> None:
-    if not findings:
+def _render_candidate_findings(assessment: Dict[str, Any]) -> None:
+    rows = assessment.get("candidate_findings") or []
+    if not rows:
+        console.print(Panel("No candidate or confirmed service findings from current evidence.", title="[bold green]Service Findings[/bold green]", border_style="green", padding=(1, 2)))
         return
-    useful = []
-    for f in findings:
-        code = str(f.get("finding_code") or "")
-        sev = str(f.get("severity") or "").lower()
-        title = str(f.get("title") or "").lower()
-        if sev == "informational" and ("tls service observed" in title or code.startswith("BBR-TLS-INFO")):
-            continue
-        if code.startswith(("BBR-WEB-HDR", "BBR-TLS-WEAK", "BBR-SSH", "BBR-SMB", "BBR-FTP", "BBR-SMTP", "BBR-RDP")):
-            useful.append(f)
-    if not useful:
-        return
-    table = Table(title="Vulnerability Identification Signals", box=box.ROUNDED, header_style="bold cyan")
-    table.add_column("Code", style="bold yellow", no_wrap=True)
-    table.add_column("Sev", no_wrap=True)
-    table.add_column("Status", no_wrap=True)
-    table.add_column("Assets", style="bright_white", overflow="fold")
+    table = Table(title="Candidate Findings", box=box.ROUNDED, header_style="bold yellow")
+    table.add_column("Service", no_wrap=True, style="bold white")
+    table.add_column("Asset", no_wrap=True, style="cyan")
+    table.add_column("Severity", no_wrap=True)
     table.add_column("Signal", style="bright_white", overflow="fold")
-    ordered = sorted(useful, key=lambda f: {"critical": 0, "high": 1, "medium": 2, "low": 3, "informational": 4}.get(str(f.get("severity")).lower(), 9))
-    for f in ordered[:10]:
-        sev = str(f.get("severity") or "")
-        assets = ", ".join(map(str, (f.get("affected_assets") or [])[:3])) or "-"
-        table.add_row(str(f.get("finding_code") or "-"), f"[{_sev_style(sev)}]{sev}[/]", str(f.get("status") or ""), _short(assets, 90), _short(f.get("title"), 120))
+    table.add_column("Evidence", style="yellow", overflow="fold")
+    for row in rows[:12]:
+        sev = str(row.get("severity") or "candidate")
+        table.add_row(str(row.get("service") or ""), str(row.get("asset") or ""), f"[{_sev_style(sev)}]{sev}[/]", _short(row.get("title"), 100), _short(row.get("evidence"), 160))
     console.print(table)
 
 
-def _render_verification_targets(results: Dict[str, Any]) -> None:
-    targets = _verification_targets(results)
-    if not targets:
+def _render_negative_results(assessment: Dict[str, Any]) -> None:
+    rows = assessment.get("negative_results") or []
+    if not rows:
+        return
+    table = Table(title="Negative / Inconclusive Results", box=box.ROUNDED, header_style="bold dim")
+    table.add_column("#", justify="right", style="dim", no_wrap=True)
+    table.add_column("Result", style="bright_white", overflow="fold")
+    for idx, item in enumerate(rows[:10], start=1):
+        table.add_row(str(idx), _short(item, 220))
+    console.print(table)
+
+
+def _render_verification_targets(assessment: Dict[str, Any]) -> None:
+    rows = assessment.get("verification_targets") or []
+    if not rows:
         return
     table = Table(title="Technical Verification Targets", box=box.ROUNDED, header_style="bold red")
-    table.add_column("Area", style="bold white", no_wrap=True)
-    table.add_column("Asset", style="bold yellow", no_wrap=True)
-    table.add_column("Verify", style="bright_white", overflow="fold")
-    table.add_column("Command / method", style="cyan", overflow="fold")
-    for row in targets:
-        table.add_row(*row)
+    table.add_column("Priority", justify="right", style="bold yellow", no_wrap=True)
+    table.add_column("Service", style="bold white", no_wrap=True)
+    table.add_column("Asset", style="cyan", no_wrap=True)
+    table.add_column("Action", style="bright_white", overflow="fold")
+    for idx, row in enumerate(rows[:10], start=1):
+        table.add_row(str(idx), str(row.get("service") or ""), str(row.get("asset") or ""), _short(row.get("action"), 220))
     console.print(table)
 
 
-def _render_tester_takeaway(results: Dict[str, Any]) -> None:
+def _render_artifacts(assessment: Dict[str, Any]) -> None:
+    artifacts = assessment.get("artifacts") or []
+    if not artifacts:
+        return
+    table = Table(title="Evidence Artifacts", box=box.SIMPLE, header_style="bold cyan")
+    table.add_column("#", justify="right", style="dim", no_wrap=True)
+    table.add_column("Path", style="bright_white", overflow="fold")
+    for idx, path in enumerate(artifacts[:8], start=1):
+        table.add_row(str(idx), _short(path, 220))
+    if len(artifacts) > 8:
+        table.add_row("…", f"+{len(artifacts) - 8} more artifact(s) in JSON report")
+    console.print(table)
+
+
+def _render_tester_takeaway(assessment: Dict[str, Any]) -> None:
     bullets: List[str] = []
-    summary = results.get("summary") or {}
-    if _has_port(results, 80) or _has_port(results, 443):
-        bullets.append("Best next technical move: rerun web recon against the scoped hostname, not just the IP.")
-    if _has_port(results, 22):
-        bullets.append("SSH is worth hardening verification, but not a finding by itself without auth/crypto weakness evidence.")
-    if int(summary.get("interesting_paths_found", 0) or 0) == 0:
-        bullets.append("Directory brute force produced no useful paths on this target/profile.")
-    if _finding_by_code(results, "BBR-COVERAGE-001"):
-        bullets.append("Current scan is reconnaissance-limited by bare-IP scope; DNS/vhost context is required for serious web testing.")
+    if assessment.get("target_type") == "bare_ip":
+        bullets.append("Highest-value next move: obtain scoped hostname/FQDN and rerun web + TLS recon with Host/SNI context.")
+    if not assessment.get("candidate_findings"):
+        bullets.append("No confirmed or candidate service vulnerability was identified from parsed evidence; preserve this as recon status, not a finding.")
+    ssh = [a for a in assessment.get("assessments") or [] if a.get("service") == "SSH"]
+    if ssh:
+        bullets.append("SSH remains a remote administration surface; validate authentication policy and crypto baseline before writing any finding.")
     if not bullets:
         return
     text = Text()
     for item in bullets[:5]:
-        text.append(f"- {_short(item, 180)}\n", style="bright_white")
+        text.append(f"- {_short(item, 190)}\n", style="bright_white")
     console.print(Panel(text, title="[bold green]Tester Takeaway[/bold green]", border_style="green", padding=(1, 2)))
