@@ -28,7 +28,6 @@ def _phase_command(results: Dict[str, Any], phase_id: str, label_contains: Optio
                 candidates.append(str(command))
     if not candidates:
         return None
-    # Prefer actual command lines over binary-path metadata like /usr/bin/nmap.
     candidates.sort(key=lambda c: (" " not in c, len(c)))
     return candidates[0]
 
@@ -81,15 +80,7 @@ def _screenshot_rows(results: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _result(tool: str, purpose: str, status: str, command: Optional[str], important_output: List[str], signals: Optional[List[str]] = None, assets: Optional[List[str]] = None) -> Dict[str, Any]:
-    return {
-        "tool": tool,
-        "purpose": purpose,
-        "status": status or "unknown",
-        "command": command,
-        "assets": assets or [],
-        "important_output": [str(x) for x in important_output if str(x or "").strip()],
-        "signals": [str(x) for x in (signals or []) if str(x or "").strip()],
-    }
+    return {"tool": tool, "purpose": purpose, "status": status or "unknown", "command": command, "assets": assets or [], "important_output": [str(x) for x in important_output if str(x or "").strip()], "signals": [str(x) for x in (signals or []) if str(x or "").strip()]}
 
 
 def _nmap_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -145,7 +136,7 @@ def _gobuster_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             lines.append(f"{base}: error={_short(scan.get('error'), 180)}")
     cmds = _phase_commands(results, "M4")
     command = " | ".join(cmds[:3]) if cmds else None
-    if len(cmds) > 3:
+    if command and len(cmds) > 3:
         command += f" | +{len(cmds)-3} more"
     return _result("gobuster/dirb", "Web content discovery across discovered HTTP(S) services", "completed", command, lines, ["interesting paths found" if total_hits else "no flagged paths"], sorted(set(assets)))
 
@@ -205,8 +196,28 @@ def _tls_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             signals.append("TLS sampled; no weak signal recorded")
     if not lines:
         return None
-    cmd = _phase_command(results, "M7")
-    return _result("sslscan", "TLS protocol/certificate review", "completed", cmd, lines, sorted(set(signals)), sorted(set(assets)))
+    return _result("sslscan", "TLS protocol/certificate review", "completed", _phase_command(results, "M7"), lines, sorted(set(signals)), sorted(set(assets)))
+
+
+def _is_completion_only_type(typ: str) -> bool:
+    typ = (typ or "").lower()
+    return typ.endswith("_scan_completed") or typ in ("ssh_algorithm_scan_completed", "http_nse_scan_completed", "nikto_scan_completed", "service script completed")
+
+
+def _summarize_finding(f: Dict[str, Any]) -> str:
+    typ = str(f.get("type") or "observed")
+    if "values" in f:
+        return f"{typ}: {_short(', '.join(map(str, f.get('values') or [])), 170)}"
+    if "shares" in f:
+        shares = [f"{x.get('name')}({x.get('type')})" for x in (f.get("shares") or []) if isinstance(x, dict)]
+        return f"{typ}: {_short(', '.join(shares), 170)}"
+    if "capabilities" in f:
+        return f"{typ}: {_short(', '.join(map(str, f.get('capabilities') or [])), 170)}"
+    if "banner" in f:
+        return f"{typ}: {_short(f.get('banner'), 170)}"
+    if "observed" in f:
+        return f"{typ}: {_short(f.get('observed'), 170)}"
+    return typ
 
 
 def _meaningful_script_lines(text: str) -> List[str]:
@@ -217,8 +228,10 @@ def _meaningful_script_lines(text: str) -> List[str]:
             continue
         if line in ("PORT   STATE SERVICE", "PORT     STATE SERVICE"):
             continue
+        if line.startswith("Service detection performed") or line.startswith("Read data files"):
+            continue
         out.append(line)
-        if len(out) >= 12:
+        if len(out) >= 10:
             break
     return out
 
@@ -231,30 +244,39 @@ def _service_enum_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     signals: List[str] = []
     assets: List[str] = []
     cmds: List[str] = []
+    completed_modules: List[str] = []
     for row in rows:
         asset = f"{row.get('host')}:{row.get('port')}"
         assets.append(asset)
         if row.get("command"):
             cmds.append(str(row.get("command")))
         findings = [f for f in (row.get("findings") or []) if isinstance(f, dict)]
-        if findings:
-            for f in findings[:8]:
-                typ = str(f.get("type"))
-                lines.append(f"{asset} {row.get('module')}: {typ} {_short(f.get('values') or f.get('observed') or f.get('banner') or f, 160)}")
+        actionable = [f for f in findings if not _is_completion_only_type(str(f.get("type") or ""))]
+        if actionable:
+            for f in actionable[:8]:
+                typ = str(f.get("type") or "observed")
+                lines.append(f"{asset} {row.get('module')}: {_summarize_finding(f)}")
                 signals.append(typ)
         else:
             script_lines = _meaningful_script_lines(str(row.get("stdout_excerpt") or ""))
             if script_lines:
-                lines.append(f"{asset} {row.get('module')}: script completed; no blacklist weak-signal matched")
-                for s in script_lines[:8]:
-                    lines.append(f"  {s}")
-                signals.append("service script completed")
-            elif row.get("error"):
+                completed_modules.append(f"{asset} {row.get('module')}")
+                # Keep only actual script rows if they reveal readable metadata; avoid generic NSE boilerplate.
+                for s in script_lines[:5]:
+                    low = s.lower()
+                    if any(tok in low for tok in ("ssh2-enum-algos", "http-title", "http-server-header", "ssl-cert", "ssl-date", "nikto", "server", "subject", "issuer", "valid", "methods")):
+                        lines.append(f"{asset} {row.get('module')}: {s}")
+            elif row.get("error") and row.get("status") not in ("skipped",):
                 lines.append(f"{asset} {row.get('module')}: error={_short(row.get('error'), 140)}")
                 signals.append("service enum error")
+    if completed_modules and not lines:
+        lines.append(f"Service enum completed across {len(completed_modules)} module(s); no actionable service-specific signal extracted")
+        signals.append("service enum completed; no actionable signal")
     if not lines:
         return None
     cmd = " | ".join(cmds[:3]) if cmds else None
+    if cmd and len(cmds) > 3:
+        cmd += f" | +{len(cmds)-3} more"
     return _result("nmap/service helpers", "Service-specific enumeration details", "completed", cmd, lines, sorted(set(signals)), sorted(set(assets)))
 
 
@@ -277,8 +299,7 @@ def _webfp_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             signals.append(str(f.get("type")))
     if not lines:
         return None
-    command = " | ".join(cmds[:3]) if cmds else None
-    return _result("whatweb/wafw00f", "Web stack and WAF fingerprint signals", "completed", command, lines, sorted(set(signals)), sorted(set(a for a in assets if a)))
+    return _result("whatweb/wafw00f", "Web stack and WAF fingerprint signals", "completed", " | ".join(cmds[:3]) if cmds else None, lines, sorted(set(signals)), sorted(set(a for a in assets if a)))
 
 
 def _screenshot_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -296,22 +317,15 @@ def _screenshot_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         lines.append(f"{row.get('url')}: screenshot={path}")
     if not lines:
         return None
-    return _result("gowitness", "Screenshot triage", "completed", " | ".join(cmds[:3]) if cmds else None, lines, ["screenshot captured"], sorted(set(assets)))
+    cmd = " | ".join(cmds[:3]) if cmds else None
+    if cmd and len(cmds) > 3:
+        cmd += f" | +{len(cmds)-3} more"
+    return _result("gowitness", "Screenshot triage", "completed", cmd, lines, ["screenshot captured"], sorted(set(assets)))
 
 
 def build_tool_results(results: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Build ordered, concise tool results for terminal and report output."""
     out: List[Dict[str, Any]] = []
-    for item in (
-        _nmap_result(results),
-        _dns_result(results),
-        _gobuster_result(results),
-        _http_header_result(results),
-        _tls_result(results),
-        _service_enum_result(results),
-        _webfp_result(results),
-        _screenshot_result(results),
-    ):
+    for item in (_nmap_result(results), _dns_result(results), _gobuster_result(results), _http_header_result(results), _tls_result(results), _service_enum_result(results), _webfp_result(results), _screenshot_result(results)):
         if item and item.get("important_output"):
             out.append(item)
     for idx, row in enumerate(out, start=1):
