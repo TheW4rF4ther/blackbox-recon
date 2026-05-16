@@ -2,19 +2,69 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
-from typing import Optional
+import time
+from typing import Any, Awaitable, Optional, TypeVar
 
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 
 
 console = Console()
+T = TypeVar("T")
 
 
 def progress_enabled() -> bool:
     val = os.environ.get("BLACKBOX_RECON_PROGRESS", "1").strip().lower()
     return val not in ("0", "false", "no", "off")
+
+
+def heartbeat_interval() -> float:
+    raw = os.environ.get("BLACKBOX_RECON_HEARTBEAT_SEC", "8").strip()
+    try:
+        return max(3.0, float(raw))
+    except Exception:
+        return 8.0
+
+
+async def with_heartbeat(label: str, awaitable: Awaitable[T], *, detail: str = "") -> T:
+    """Run an awaitable while printing a low-noise heartbeat.
+
+    This intentionally avoids percentages. It only proves the operator that the
+    scan is still alive during quiet long-running subprocesses.
+    """
+    if not progress_enabled():
+        return await awaitable
+
+    done = asyncio.Event()
+    start = time.monotonic()
+    frames = ("◐", "◓", "◑", "◒")
+    interval = heartbeat_interval()
+
+    async def _beat() -> None:
+        i = 0
+        while not done.is_set():
+            elapsed = time.monotonic() - start
+            msg = f"[cyan]{frames[i % len(frames)]}[/cyan] [bold]Running:[/bold] {label} [dim]({elapsed:.0f}s elapsed)[/dim]"
+            if detail:
+                msg += f" [dim]— {detail}[/dim]"
+            console.print(msg)
+            i += 1
+            try:
+                await asyncio.wait_for(done.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+
+    task = asyncio.create_task(_beat())
+    try:
+        return await awaitable
+    finally:
+        done.set()
+        try:
+            await task
+        except Exception:
+            pass
 
 
 class OperatorProgress:
