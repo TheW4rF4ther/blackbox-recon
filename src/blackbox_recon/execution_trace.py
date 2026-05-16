@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -24,6 +25,12 @@ def _phase_lookup(phase_id: str):
 
 def _banner_line(ch: str = "─", width: int = 68) -> str:
     return ch * width
+
+
+def _verbose_phase_echo_enabled() -> bool:
+    """Return True only when explicit verbose phase echo is requested."""
+    val = os.environ.get("BLACKBOX_RECON_VERBOSE_PHASES", "").strip().lower()
+    return val in ("1", "true", "yes", "on")
 
 
 # Longest-first so "Wordlist path:" wins over "Wordlist:"
@@ -52,12 +59,13 @@ class PhaseTracer:
     """
     Append structured phase records to ``results['recon_phase_trace']`` and optionally echo banners.
 
-    Each phase documents the *actual* tooling (external CLIs and Python stack) used in that step.
+    Default terminal output is intentionally quiet. Phase banners are preserved in
+    JSON and only echoed when BLACKBOX_RECON_VERBOSE_PHASES=1 is set.
     """
 
     def __init__(self, results: Dict[str, Any], *, echo: bool = True) -> None:
         self.results = results
-        self.echo = echo
+        self.echo = bool(echo and _verbose_phase_echo_enabled())
         self._entry: Optional[Dict[str, Any]] = None
 
     def _ensure_list(self) -> List[Dict[str, Any]]:
@@ -178,7 +186,7 @@ def summarize_execution_trace(trace: List[Dict[str, Any]]) -> Dict[str, Any]:
 def print_execution_recap(results: Dict[str, Any], *, echo: bool = True) -> None:
     """Plain-text recap after engine.run (in addition to JSON trace)."""
     trace = results.get("recon_phase_trace") or []
-    if not echo or not trace:
+    if not echo or not trace or not _verbose_phase_echo_enabled():
         return
     rprint()
     rprint(f"[dim]{escape(_banner_line('─', 72))}[/dim]")
