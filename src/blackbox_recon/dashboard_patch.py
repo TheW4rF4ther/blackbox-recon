@@ -9,12 +9,7 @@ from .triage_dashboard import render_triage_dashboard
 
 
 def _install_legacy_terminal_suppressor() -> None:
-    """Suppress legacy CLI sections after the new triage dashboard renders.
-
-    cli.py still contains older post-run tables. The new dashboard is now the
-    authoritative terminal output, so this suppressor drops only those duplicate
-    legacy prints while preserving report writing and the final saved-path line.
-    """
+    """Suppress legacy CLI sections after the new triage dashboard renders."""
     cli_mod = sys.modules.get("blackbox_recon.cli") or sys.modules.get("src.blackbox_recon.cli")
     if cli_mod is None or not hasattr(cli_mod, "console"):
         return
@@ -71,13 +66,11 @@ def _install_default_phase_suppressor() -> None:
         return
 
     original_print = console.print
-    state = {"suppress_block": False}
 
     def filtered_print(*objects: Any, **kwargs: Any) -> None:
         text = " ".join(str(o) for o in objects)
         stripped = text.strip()
 
-        # Keep branding, notice, high-level start, dashboard, AI status, report path, and final footer.
         keep_tokens = (
             "Blackbox Recon",
             "Notice",
@@ -89,6 +82,7 @@ def _install_default_phase_suppressor() -> None:
             "Attack Surface",
             "Service Assessments",
             "Service Findings",
+            "Negative / Inconclusive Summary",
             "Technical Verification Targets",
             "Evidence Artifacts",
             "Tester Takeaway",
@@ -101,10 +95,8 @@ def _install_default_phase_suppressor() -> None:
             "Error:",
         )
         if any(tok in text for tok in keep_tokens):
-            state["suppress_block"] = False
             return original_print(*objects, **kwargs)
 
-        # Suppress verbose PTES/phase scaffolding and command echo in default mode.
         noisy_tokens = (
             "PTES M",
             "Intelligence Gathering",
@@ -113,16 +105,27 @@ def _install_default_phase_suppressor() -> None:
             "Objective:",
             "Stack:",
             "Wordlist:",
+            "Wordlist path:",
+            "Tool preference:",
+            "Configured port_scan_mode:",
+            "Targets:",
+            "Service enrichment:",
             "method:",
-            "nmap_",
-            "nslookup",
-            "feroxbuster:",
-            "requests_",
-            "tls_probe:",
+            "nmap_binary:",
+            "nmap_profile:",
+            "nmap_aggressive:",
+            "nmap_ssh_algorithms:",
+            "nmap_http_safe_scripts:",
             "nikto_http:",
+            "ssh_audit:",
             "whatweb:",
             "wafw00f:",
             "dns_PTR:",
+            "tls_probe:",
+            "requests_headers:",
+            "requests_fingerprint:",
+            "python_http_probe:",
+            "nslookup:",
             "screenshot:",
             "Execution recap",
             "Phase complete",
@@ -135,9 +138,13 @@ def _install_default_phase_suppressor() -> None:
             "Enumerating subdomains",
             "Found 0 valid subdomains",
             "Default port scan:",
+            "nmap aggressive scan",
             "Web content discovery on",
+            "feroxbuster:",
         )
-        if any(tok in text for tok in noisy_tokens) or stripped.startswith("─") or stripped.startswith("·") or stripped.startswith("→"):
+        if any(tok in text for tok in noisy_tokens):
+            return
+        if stripped.startswith("─") or stripped.startswith("·") or stripped.startswith("→") or stripped.startswith("===="):
             return
 
         return original_print(*objects, **kwargs)
@@ -152,9 +159,6 @@ class DashboardAwareResults(dict):
     def __init__(self, source: Dict[str, Any]):
         super().__init__(source)
         self["operator_dashboard_rendered"] = True
-        # Suppress the old legacy phase table and old truncated findings table
-        # printed by cli.py immediately after engine.run(). JSON/report data is
-        # still present for saved output and downstream processing.
         self._suppress_once = {"recon_phase_trace": 1, "deterministic_findings": 1}
 
     def get(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
@@ -169,10 +173,11 @@ def patch_operator_dashboard(ReconEngine: Any) -> None:
     if getattr(ReconEngine, "_blackbox_operator_dashboard_patched", False):
         return
 
-    _install_default_phase_suppressor()
     original_run = ReconEngine.run
 
     async def run_with_operator_dashboard(self: Any, target: str, modules: List[str]) -> Dict[str, Any]:
+        # Install immediately before scanning, when cli.py/console definitely exists.
+        _install_default_phase_suppressor()
         results = await original_run(self, target, modules)
         try:
             render_triage_dashboard(results)
