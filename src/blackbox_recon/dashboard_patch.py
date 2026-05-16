@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import sys
+import time
+from functools import wraps
 from typing import Any, Dict, List
 
+from .operator_progress import console as progress_console
+from .operator_progress import progress_enabled
 from .triage_dashboard import render_triage_dashboard
 
 
@@ -52,6 +56,17 @@ _NOISY_RECON_TOKENS = (
     "nmap aggressive scan",
     "Web content discovery on",
     "feroxbuster:",
+)
+
+_PROGRESS_PHASES = (
+    ("_run_http_header_enrichment", "HTTP header posture"),
+    ("_run_tls_enrichment", "TLS posture"),
+    ("_run_service_enrichment", "Service-specific enumeration"),
+    ("_run_web_fingerprint_enrichment", "Web fingerprinting"),
+    ("_run_cms_enrichment", "CMS/app-aware enumeration"),
+    ("_run_vuln_intel_enrichment", "Vulnerability intelligence"),
+    ("_run_dns_enrichment", "DNS enrichment"),
+    ("_run_screenshot_triage", "Screenshot triage"),
 )
 
 
@@ -166,7 +181,6 @@ def _install_recon_rprint_suppressor() -> None:
 
         recon_mod.rprint = filtered_rprint
 
-    # Force phase banners/recaps off in normal operator mode even if config default says True.
     try:
         original_phase_tracer = recon_mod.PhaseTracer
         if not getattr(original_phase_tracer, "_blackbox_quiet_init", False):
@@ -185,6 +199,49 @@ def _install_recon_rprint_suppressor() -> None:
 
     recon_mod.print_execution_recap = quiet_execution_recap
     recon_mod._blackbox_rprint_suppressor = True
+
+
+def _install_enrichment_progress_wrappers() -> None:
+    """Wrap long enrichment phases with compact operator progress messages."""
+    if not progress_enabled():
+        return
+    mod = sys.modules.get("blackbox_recon.posture_enrichment") or sys.modules.get("src.blackbox_recon.posture_enrichment")
+    if mod is None or getattr(mod, "_blackbox_progress_wrapped", False):
+        return
+
+    total = len(_PROGRESS_PHASES)
+    state = {"idx": 0}
+
+    def _make_wrapper(fn: Any, label: str):
+        @wraps(fn)
+        async def wrapped(*args: Any, **kwargs: Any) -> Any:
+            state["idx"] += 1
+            idx = state["idx"]
+            start = time.monotonic()
+            progress_console.print(f"[cyan][{idx}/{total}][/cyan] [bold]Recon progress:[/bold] {label} [dim](running)[/dim]")
+            if label == "CMS/app-aware enumeration":
+                progress_console.print("[dim]    CMS probes and WPScan can take a few minutes on lab targets.[/dim]")
+            elif label == "Vulnerability intelligence":
+                progress_console.print("[dim]    Checking local SearchSploit and NVD/NIST candidate CVE leads.[/dim]")
+            try:
+                result = await fn(*args, **kwargs)
+                elapsed = time.monotonic() - start
+                progress_console.print(f"[green][{idx}/{total}][/green] {label} complete [dim]({elapsed:.1f}s)[/dim]")
+                return result
+            except Exception as exc:
+                elapsed = time.monotonic() - start
+                progress_console.print(f"[red][{idx}/{total}][/red] {label} failed after {elapsed:.1f}s: {exc}")
+                raise
+        return wrapped
+
+    for func_name, label in _PROGRESS_PHASES:
+        fn = getattr(mod, func_name, None)
+        if callable(fn) and not getattr(fn, "_blackbox_progress_wrapped", False):
+            wrapped = _make_wrapper(fn, label)
+            wrapped._blackbox_progress_wrapped = True
+            setattr(mod, func_name, wrapped)
+
+    mod._blackbox_progress_wrapped = True
 
 
 class DashboardAwareResults(dict):
@@ -212,12 +269,13 @@ def patch_operator_dashboard(ReconEngine: Any) -> None:
     async def run_with_operator_dashboard(self: Any, target: str, modules: List[str]) -> Dict[str, Any]:
         _install_default_phase_suppressor()
         _install_recon_rprint_suppressor()
+        _install_enrichment_progress_wrappers()
         results = await original_run(self, target, modules)
         try:
             render_triage_dashboard(results)
             _install_legacy_terminal_suppressor()
             return DashboardAwareResults(results)
-        except Exception as exc:  # dashboard must never fail the scan
+        except Exception as exc:
             try:
                 from rich import print as rprint
                 rprint(f"[yellow][!][/yellow] Triage dashboard failed to render: {exc}")
