@@ -201,7 +201,7 @@ def _tls_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def _is_completion_only_type(typ: str) -> bool:
     typ = (typ or "").lower()
-    return typ.endswith("_scan_completed") or typ in ("ssh_algorithm_scan_completed", "http_nse_scan_completed", "nikto_scan_completed", "service script completed")
+    return typ.endswith("_scan_completed") or typ in ("ssh_algorithm_scan_completed", "http_nse_scan_completed", "nikto_scan_completed", "service script completed", "ssh_audit_completed")
 
 
 def _summarize_finding(f: Dict[str, Any]) -> str:
@@ -220,6 +220,17 @@ def _summarize_finding(f: Dict[str, Any]) -> str:
     return typ
 
 
+def _looks_actionable_script_line(line: str) -> bool:
+    low = (line or "").lower().strip()
+    if not low:
+        return False
+    noisy = ("nikto v", "ssh2-enum-algos:", "| ssh2-enum-algos:", "http-title:", "http-server-header:")
+    if any(low.endswith(x) or low == x for x in noisy):
+        return False
+    actionable_tokens = ("weak", "deprecated", "vulnerable", "allowed methods", "webdav", "directory indexing", "admin", "backup", "default file", "server:", "subject:", "issuer:", "valid:", "not valid", "expired", "anonymous", "signing", "cipher", "kex", "mac")
+    return any(tok in low for tok in actionable_tokens)
+
+
 def _meaningful_script_lines(text: str) -> List[str]:
     out: List[str] = []
     for raw in (text or "").splitlines():
@@ -230,7 +241,8 @@ def _meaningful_script_lines(text: str) -> List[str]:
             continue
         if line.startswith("Service detection performed") or line.startswith("Read data files"):
             continue
-        out.append(line)
+        if _looks_actionable_script_line(line):
+            out.append(line)
         if len(out) >= 10:
             break
     return out
@@ -261,14 +273,13 @@ def _service_enum_result(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             script_lines = _meaningful_script_lines(str(row.get("stdout_excerpt") or ""))
             if script_lines:
                 completed_modules.append(f"{asset} {row.get('module')}")
-                # Keep only actual script rows if they reveal readable metadata; avoid generic NSE boilerplate.
                 for s in script_lines[:5]:
-                    low = s.lower()
-                    if any(tok in low for tok in ("ssh2-enum-algos", "http-title", "http-server-header", "ssl-cert", "ssl-date", "nikto", "server", "subject", "issuer", "valid", "methods")):
-                        lines.append(f"{asset} {row.get('module')}: {s}")
+                    lines.append(f"{asset} {row.get('module')}: {s}")
             elif row.get("error") and row.get("status") not in ("skipped",):
                 lines.append(f"{asset} {row.get('module')}: error={_short(row.get('error'), 140)}")
                 signals.append("service enum error")
+            elif row.get("status") not in ("skipped",):
+                completed_modules.append(f"{asset} {row.get('module')}")
     if completed_modules and not lines:
         lines.append(f"Service enum completed across {len(completed_modules)} module(s); no actionable service-specific signal extracted")
         signals.append("service enum completed; no actionable signal")
