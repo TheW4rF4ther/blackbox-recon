@@ -1,11 +1,9 @@
 """Post-scan posture and service enrichment hook for ReconEngine.
 
-This module wires M6-M11 enrichment into the existing run loop without changing
-the scanner's core phases. It is intentionally observational: it runs HTTP
-header sampling, TLS posture sampling, service-specific enumeration, web
-fingerprinting, DNS enrichment, and optional screenshot triage only against
-assets discovered by the current run, then refreshes the evidence package and
-deterministic findings.
+This module wires enrichment into the existing run loop without changing the
+scanner's core phases. It is intentionally observational and service-aware:
+it runs HTTP/TLS/service/web/DNS/screenshot enrichment only against assets
+discovered by the current run, then refreshes evidence and findings.
 """
 
 from __future__ import annotations
@@ -25,6 +23,7 @@ from .reporting import build_executive_snapshot, utc_now_iso
 from .screenshots import run_screenshot_triage
 from .service_enum import run_service_enumeration
 from .tls_scan import scan_tls_url
+from .web_cms import run_cms_enumeration
 from .web_fingerprint import run_web_fingerprinting
 
 
@@ -37,6 +36,11 @@ def _dedupe(seq: Iterable[str]) -> List[str]:
         seen.add(item)
         out.append(item)
     return out
+
+
+def _quiet() -> bool:
+    # Default operator mode should be quiet. Verbose phase echo is handled by execution_trace.
+    return True
 
 
 def _trace_append(results: Dict[str, Any], *, phase_id: str, phase_name: str, status: str, detail: str, stack_lines: List[str], commands: List[Dict[str, Any]]) -> None:
@@ -67,30 +71,21 @@ async def _run_http_header_enrichment(engine: Any, results: Dict[str, Any], urls
     if not bool(getattr(engine, "config", {}).get("http_headers_enabled", True)):
         _trace_append(results, phase_id="M6", phase_name="HTTP security header posture", status="skipped", detail="http_headers_enabled is false", stack_lines=["Stack: Python requests header sampling"], commands=[])
         return
-    rprint("\n────────────────────────────────────────────────────────────────────────")
-    rprint("  PTES M6 · HTTP security header posture")
-    rprint("  Vulnerability Analysis › Web application hardening review")
-    rprint("────────────────────────────────────────────────────────────────────────")
-    rprint("    · Objective: Sample discovered HTTP(S) services for security headers, disclosure headers, cookies, redirects, and titles.")
-    rprint("    · Stack: Python requests (GET, redirects enabled, TLS verification disabled for lab/authorized testing)")
+    timeout = int(getattr(engine, "config", {}).get("http_headers_timeout_sec", 10) or 10)
     if not urls:
         results["http_header_analysis"] = {"results": []}
         _trace_append(results, phase_id="M6", phase_name="HTTP security header posture", status="completed", detail="No HTTP(S) URLs available for header analysis", stack_lines=["Stack: Python requests header sampling"], commands=[])
-        rprint("  → Phase complete (completed): 0 URL(s) analyzed")
         return
-    timeout = int(getattr(engine, "config", {}).get("http_headers_timeout_sec", 10) or 10)
     analyzer = HttpHeaderAnalyzer(timeout=timeout)
     loop = asyncio.get_running_loop()
     commands: List[Dict[str, Any]] = []
     out: List[Dict[str, Any]] = []
     for url in urls:
-        rprint(f"     requests_headers: GET {escape(url)} timeout={timeout} verify=False allow_redirects=True")
         row = await loop.run_in_executor(None, partial(analyzer.analyze, url))
         out.append(row)
         commands.append({"label": "requests_headers", "command": f"GET {url} timeout={timeout} verify=False allow_redirects=True", "url": url, "status": row.get("status_code"), "error": row.get("error")})
     results["http_header_analysis"] = {"results": out}
     _trace_append(results, phase_id="M6", phase_name="HTTP security header posture", status="completed", detail=f"{len(out)} HTTP(S) URL(s) analyzed for security/disclosure headers", stack_lines=["Stack: Python requests header sampling"], commands=commands)
-    rprint(f"  → Phase complete (completed): {len(out)} URL(s) analyzed")
 
 
 async def _run_tls_enrichment(engine: Any, results: Dict[str, Any], urls: List[str]) -> None:
@@ -98,16 +93,9 @@ async def _run_tls_enrichment(engine: Any, results: Dict[str, Any], urls: List[s
         _trace_append(results, phase_id="M7", phase_name="TLS posture sampling", status="skipped", detail="tls_scan_enabled is false", stack_lines=["Stack: sslscan when available; Python ssl fallback"], commands=[])
         return
     https_urls = [u for u in urls if u.lower().startswith("https://")]
-    rprint("\n────────────────────────────────────────────────────────────────────────")
-    rprint("  PTES M7 · TLS posture sampling")
-    rprint("  Vulnerability Analysis › Transport security review")
-    rprint("────────────────────────────────────────────────────────────────────────")
-    rprint("    · Objective: Sample HTTPS services for certificate metadata, protocol support, and weak TLS signals.")
-    rprint("    · Stack: sslscan when installed; Python ssl certificate fallback")
     if not https_urls:
         results["tls_analysis"] = {"results": []}
         _trace_append(results, phase_id="M7", phase_name="TLS posture sampling", status="completed", detail="No HTTPS URLs available for TLS sampling", stack_lines=["Stack: sslscan when available; Python ssl fallback"], commands=[])
-        rprint("  → Phase complete (completed): 0 HTTPS service(s) analyzed")
         return
     timeout = int(getattr(engine, "config", {}).get("tls_scan_timeout_sec", 60) or 60)
     loop = asyncio.get_running_loop()
@@ -118,23 +106,15 @@ async def _run_tls_enrichment(engine: Any, results: Dict[str, Any], urls: List[s
         if row:
             out.append(row)
             cmd = row.get("command") or f"python_ssl_cert_probe {row.get('host')}:{row.get('port')}"
-            rprint(f"     tls_probe: {escape(cmd)}")
             commands.append({"label": row.get("tool") or "tls_scan", "command": cmd, "url": url, "status": row.get("status"), "weak_signals": row.get("weak_signals") or []})
     results["tls_analysis"] = {"results": out}
     _trace_append(results, phase_id="M7", phase_name="TLS posture sampling", status="completed", detail=f"{len(out)} HTTPS service(s) analyzed for TLS posture", stack_lines=["Stack: sslscan when available; Python ssl fallback"], commands=commands)
-    rprint(f"  → Phase complete (completed): {len(out)} HTTPS service(s) analyzed")
 
 
 async def _run_service_enrichment(engine: Any, results: Dict[str, Any]) -> None:
     if not bool(getattr(engine, "config", {}).get("service_enum_enabled", True)):
         _trace_append(results, phase_id="M8", phase_name="Service-specific enumeration", status="skipped", detail="service_enum_enabled is false", stack_lines=["Stack: service-aware safe enumeration dispatcher"], commands=[])
         return
-    rprint("\n────────────────────────────────────────────────────────────────────────")
-    rprint("  PTES M8 · Service-specific enumeration")
-    rprint("  Vulnerability Analysis › Service-aware safe enumeration")
-    rprint("────────────────────────────────────────────────────────────────────────")
-    rprint("    · Objective: Run safe, focused enumeration modules only for services already confirmed open.")
-    rprint("    · Stack: nmap NSE where appropriate, smbclient, Python ftplib/socket helpers")
     port_rows = results.get("ports") or []
     timeout = int(getattr(engine, "config", {}).get("service_enum_timeout_sec", 60) or 60)
     max_services = int(getattr(engine, "config", {}).get("service_enum_max_services", 24) or 24)
@@ -144,22 +124,14 @@ async def _run_service_enrichment(engine: Any, results: Dict[str, Any]) -> None:
     commands: List[Dict[str, Any]] = []
     for row in enum.get("results") or []:
         cmd = row.get("command") or row.get("module") or "service_enum"
-        rprint(f"     {escape(str(row.get('module') or 'service_enum'))}: {escape(str(cmd))}")
         commands.append({"label": row.get("module") or "service_enum", "command": cmd, "host": row.get("host"), "port": row.get("port"), "status": row.get("status"), "findings": len(row.get("findings") or [])})
     _trace_append(results, phase_id="M8", phase_name="Service-specific enumeration", status="completed", detail=f"{enum.get('modules_run', 0)} service module(s) run across {enum.get('services_considered', 0)} open service(s)", stack_lines=["Stack: service-aware safe enumeration dispatcher"], commands=commands)
-    rprint(f"  → Phase complete (completed): {enum.get('modules_run', 0)} service module(s) run")
 
 
 async def _run_web_fingerprint_enrichment(engine: Any, results: Dict[str, Any], urls: List[str]) -> None:
     if not bool(getattr(engine, "config", {}).get("web_fingerprint_enabled", True)):
         _trace_append(results, phase_id="M9", phase_name="Web fingerprinting", status="skipped", detail="web_fingerprint_enabled is false", stack_lines=["Stack: whatweb and wafw00f when installed"], commands=[])
         return
-    rprint("\n────────────────────────────────────────────────────────────────────────")
-    rprint("  PTES M9 · Web fingerprinting")
-    rprint("  Intelligence Gathering › Application and WAF fingerprinting")
-    rprint("────────────────────────────────────────────────────────────────────────")
-    rprint("    · Objective: Fingerprint web technologies and WAF/CDN signals on discovered HTTP(S) URLs.")
-    rprint("    · Stack: whatweb + wafw00f when installed; skipped gracefully when missing")
     timeout = int(getattr(engine, "config", {}).get("web_fingerprint_timeout_sec", 60) or 60)
     loop = asyncio.get_running_loop()
     fp = await loop.run_in_executor(None, partial(run_web_fingerprinting, urls, timeout_sec=timeout, max_urls=len(urls) or 1))
@@ -167,21 +139,32 @@ async def _run_web_fingerprint_enrichment(engine: Any, results: Dict[str, Any], 
     commands: List[Dict[str, Any]] = []
     for row in fp.get("results") or []:
         cmd = row.get("command") or f"{row.get('tool')} skipped"
-        rprint(f"     {escape(str(row.get('module') or 'web_fp'))}: {escape(str(cmd))}")
         commands.append({"label": row.get("module") or "web_fp", "command": cmd, "url": row.get("url"), "status": row.get("status"), "findings": len(row.get("findings") or [])})
     _trace_append(results, phase_id="M9", phase_name="Web fingerprinting", status="completed", detail=f"{fp.get('modules_run', 0)} web fingerprint module(s) run across {fp.get('urls_considered', 0)} URL(s)", stack_lines=["Stack: whatweb and wafw00f when installed"], commands=commands)
-    rprint(f"  → Phase complete (completed): {fp.get('modules_run', 0)} fingerprint module(s) run")
+
+
+async def _run_cms_enrichment(engine: Any, results: Dict[str, Any], urls: List[str]) -> None:
+    if not bool(getattr(engine, "config", {}).get("cms_enum_enabled", True)):
+        _trace_append(results, phase_id="M9B", phase_name="CMS and app-aware web enumeration", status="skipped", detail="cms_enum_enabled is false", stack_lines=["Stack: CMS path probes + WPScan when WordPress is detected"], commands=[])
+        return
+    timeout = int(getattr(engine, "config", {}).get("cms_enum_timeout_sec", 12) or 12)
+    wpscan_timeout = int(getattr(engine, "config", {}).get("wpscan_timeout_sec", 240) or 240)
+    loop = asyncio.get_running_loop()
+    cms = await loop.run_in_executor(None, partial(run_cms_enumeration, urls, timeout_sec=timeout, wpscan_timeout_sec=wpscan_timeout, max_urls=len(urls) or 1))
+    results["cms_enumeration"] = cms
+    commands: List[Dict[str, Any]] = []
+    for row in cms.get("results") or []:
+        commands.append({"label": "cms_path_probe", "command": f"CMS known-path probes against {row.get('url')}", "url": row.get("url"), "status": row.get("status"), "findings": len(row.get("findings") or [])})
+        wps = row.get("wpscan") or {}
+        if isinstance(wps, dict) and wps.get("command"):
+            commands.append({"label": "wpscan", "command": wps.get("command"), "url": row.get("url"), "status": wps.get("status"), "findings": len(wps.get("findings") or [])})
+    _trace_append(results, phase_id="M9B", phase_name="CMS and app-aware web enumeration", status="completed", detail=f"{cms.get('cms_signals', 0)} CMS/app signal group(s) observed across {cms.get('urls_considered', 0)} URL(s)", stack_lines=["Stack: CMS path probes + WPScan when WordPress is detected"], commands=commands)
 
 
 async def _run_dns_enrichment(engine: Any, results: Dict[str, Any], target: str) -> None:
     if not bool(getattr(engine, "config", {}).get("dns_enrichment_enabled", True)):
         _trace_append(results, phase_id="M10", phase_name="DNS record enrichment", status="skipped", detail="dns_enrichment_enabled is false", stack_lines=["Stack: dig when installed; Python socket fallback"], commands=[])
         return
-    rprint("\n────────────────────────────────────────────────────────────────────────")
-    rprint("  PTES M10 · DNS record enrichment")
-    rprint("  Intelligence Gathering › DNS record inventory")
-    rprint("────────────────────────────────────────────────────────────────────────")
-    rprint("    · Objective: Collect DNS record inventory for the scoped target using dig/Python fallback.")
     timeout = int(getattr(engine, "config", {}).get("dns_enrichment_timeout_sec", 20) or 20)
     loop = asyncio.get_running_loop()
     dns = await loop.run_in_executor(None, partial(run_dns_enrichment, target, timeout_sec=timeout))
@@ -189,22 +172,14 @@ async def _run_dns_enrichment(engine: Any, results: Dict[str, Any], target: str)
     commands: List[Dict[str, Any]] = []
     for row in dns.get("results") or []:
         cmd = row.get("command") or f"{row.get('tool')} {row.get('record_type')} {row.get('target')}"
-        rprint(f"     dns_{escape(str(row.get('record_type')))}: {escape(str(cmd))}")
         commands.append({"label": f"dns_{row.get('record_type')}", "command": cmd, "status": row.get("status"), "records": len(row.get("records") or [])})
     _trace_append(results, phase_id="M10", phase_name="DNS record enrichment", status="completed", detail=f"{dns.get('queries_run', 0)} DNS record query/queries executed", stack_lines=["Stack: dig when installed; Python socket fallback"], commands=commands)
-    rprint(f"  → Phase complete (completed): {dns.get('queries_run', 0)} DNS query/queries executed")
 
 
 async def _run_screenshot_triage(engine: Any, results: Dict[str, Any], urls: List[str], target: str) -> None:
     if not bool(getattr(engine, "config", {}).get("screenshot_enabled", True)):
         _trace_append(results, phase_id="M11", phase_name="Screenshot triage", status="skipped", detail="screenshot_enabled is false", stack_lines=["Stack: gowitness when installed"], commands=[])
         return
-    rprint("\n────────────────────────────────────────────────────────────────────────")
-    rprint("  PTES M11 · Screenshot triage")
-    rprint("  Intelligence Gathering › Visual web service triage")
-    rprint("────────────────────────────────────────────────────────────────────────")
-    rprint("    · Objective: Capture screenshots of discovered HTTP(S) services for operator triage.")
-    rprint("    · Stack: gowitness when installed; skipped gracefully when missing")
     base = Path.home() / ".blackbox-recon" / "screenshots" / str(target).replace("/", "_")
     timeout = int(getattr(engine, "config", {}).get("screenshot_timeout_sec", 90) or 90)
     loop = asyncio.get_running_loop()
@@ -213,10 +188,8 @@ async def _run_screenshot_triage(engine: Any, results: Dict[str, Any], urls: Lis
     commands: List[Dict[str, Any]] = []
     for row in ss.get("results") or []:
         cmd = row.get("command") or f"{row.get('tool')} skipped"
-        rprint(f"     screenshot: {escape(str(cmd))}")
         commands.append({"label": "screenshot", "command": cmd, "url": row.get("url"), "status": row.get("status"), "path": row.get("screenshot_path")})
     _trace_append(results, phase_id="M11", phase_name="Screenshot triage", status="completed", detail=f"{ss.get('screenshots_captured', 0)} screenshot(s) captured across {ss.get('urls_considered', 0)} URL(s)", stack_lines=["Stack: gowitness when installed"], commands=commands)
-    rprint(f"  → Phase complete (completed): {ss.get('screenshots_captured', 0)} screenshot(s) captured")
 
 
 def _service_findings(results: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -237,14 +210,41 @@ def _service_findings(results: Dict[str, Any]) -> List[Dict[str, Any]]:
             _add("BBR-SMB-001", "SMB anonymous share listing observed", "medium", asset, evidence_ref, "Anonymous SMB share enumeration can disclose share names and guide follow-on access attempts.", "Disable null-session share listing and restrict SMB exposure to trusted networks/VPN.", "Re-run smbclient anonymous listing and confirm shares are not disclosed.", "high")
         if "weak_ssh_algorithm_signal" in ftypes:
             _add("BBR-SSH-001", "Weak SSH algorithm signal observed", "medium", asset, evidence_ref, "Legacy SSH algorithms can weaken cryptographic posture and may enable downgrade or compatibility risks.", "Disable legacy SSH KEX, host-key, cipher, and MAC algorithms according to current hardening guidance.", "Re-run ssh2-enum-algos and confirm weak algorithms are absent.", "medium")
-        if "smtp_starttls_offered" in ftypes:
-            _add("BBR-SMTP-INFO-001", "SMTP STARTTLS capability observed", "informational", asset, evidence_ref, "SMTP service advertises STARTTLS, which should be validated for certificate and protocol strength.", "Review SMTP TLS posture and mail relay configuration under authorized scope.", "Confirm STARTTLS configuration aligns with organizational mail security requirements.", "medium")
-        elif "smtp_ehlo_capabilities" in ftypes:
-            _add("BBR-SMTP-INFO-002", "SMTP service capabilities observed", "informational", asset, evidence_ref, "SMTP EHLO capabilities provide service metadata for defensive inventory and hardening review.", "Review exposed SMTP service role, relay policy, and STARTTLS availability.", "Confirm SMTP exposure is required and restricted appropriately.", "medium")
-        if "rdp_encryption_metadata" in ftypes or "rdp_security_protocol_metadata" in ftypes:
-            _add("BBR-RDP-INFO-001", "RDP encryption metadata observed", "informational", asset, evidence_ref, "RDP security metadata was captured for follow-up hardening review.", "Confirm Network Level Authentication and strong TLS settings are required for exposed RDP services.", "Re-run RDP encryption enumeration and verify expected controls.", "medium")
-        if "service_banner" in ftypes:
-            _add("BBR-SVC-BANNER-001", "Service banner captured", "informational", asset, evidence_ref, "Banners can aid asset inventory and may disclose product details to unauthenticated users.", "Review whether banner disclosure is necessary and whether service versions are current.", "Re-run banner collection and confirm expected disclosure level.", "medium")
+    return out
+
+
+def _cms_findings(results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    idx = len(results.get("deterministic_findings") or []) + 1
+    def _add(code: str, title: str, severity: str, asset: str, evidence_ref: str, impact: str, recommendation: str, validation: str, confidence: str = "medium") -> None:
+        nonlocal idx
+        out.append({"id": f"DET-FIND-{idx:03d}", "finding_code": code, "title": title, "severity": severity, "status": "confirmed", "affected_assets": [asset], "evidence_ids": [evidence_ref], "impact": impact, "recommendation": recommendation, "validation": validation, "confidence": confidence})
+        idx += 1
+    for i, row in enumerate((results.get("cms_enumeration") or {}).get("results") or []):
+        asset = row.get("url") or "web"
+        evidence_ref = f"CMS-ENUM-{i+1:03d}"
+        findings = [f for f in (row.get("findings") or []) if isinstance(f, dict)]
+        types = {f.get("type") for f in findings}
+        cms = row.get("cms") or []
+        if cms:
+            _add("BBR-CMS-001", f"CMS detected: {', '.join(map(str, cms))}", "medium", asset, evidence_ref, "CMS identification gives the tester a specific application enumeration path and version/plugin/user checks.", "Continue CMS-aware enumeration and validate exact version, themes/plugins, and exposed login/XML-RPC endpoints.", "Confirm CMS identity using source, known paths, and CMS-native scanner artifacts.", "high")
+        versions = [f.get("version") for f in findings if f.get("type") == "wordpress_version" and f.get("version")]
+        if versions:
+            _add("BBR-WP-001", f"WordPress version identified: {versions[0]}", "medium", asset, evidence_ref, "A precise WordPress version enables targeted vulnerability research and patch-level validation.", "Validate WordPress core version and review known issues in the context of the target and available plugins/themes.", "Confirm version through WPScan, feed generator, readme, or authenticated admin inventory.", "high")
+        if "wordpress_login_found" in types:
+            _add("BBR-WP-LOGIN-001", "WordPress login endpoint exposed", "medium", asset, evidence_ref, "The WordPress login endpoint is a primary authentication surface and may enable username validation or password policy testing under ROE.", "Validate authentication controls, MFA/lockout, and username exposure; do not brute force unless explicitly authorized.", "Open /wp-login.php and verify expected access controls under scope.", "high")
+        if "wordpress_xmlrpc_enabled" in types:
+            _add("BBR-WP-XMLRPC-001", "WordPress XML-RPC endpoint enabled", "medium", asset, evidence_ref, "XML-RPC can expand authentication and pingback attack surface depending on configuration.", "Validate whether XML-RPC is required; restrict or disable if not needed and review rate limiting.", "Request /xmlrpc.php and confirm methods/configuration under ROE.", "high")
+        users = []
+        for f in findings:
+            if f.get("type") == "wordpress_users_identified":
+                users.extend(f.get("users") or [])
+        if users:
+            _add("BBR-WP-USERS-001", f"WordPress usernames identified: {', '.join(users[:6])}", "medium", asset, evidence_ref, "Enumerated usernames provide valid account targets for password policy validation if authorized.", "Review username exposure and validate login protections; do not perform password attacks without explicit ROE authorization.", "Confirm enumerated users with WPScan artifact and application responses.", "high")
+        interesting = [f for f in findings if f.get("type") == "interesting_path"]
+        if interesting:
+            paths = ", ".join(str(f.get("path")) for f in interesting[:8])
+            _add("BBR-WEB-PATH-001", f"Interesting web paths discovered: {paths}", "medium", asset, evidence_ref, "Interesting paths can reveal application functionality, hidden content, or administrative surface.", "Manually browse and validate access control, content sensitivity, and application behavior for discovered paths.", "Review CMS/path enumeration artifacts and manually validate each path.", "high")
     return out
 
 
@@ -260,17 +260,6 @@ def _web_dns_findings(results: Dict[str, Any]) -> List[Dict[str, Any]]:
         asset = row.get("url") or "web"
         if "whatweb_fingerprint" in ftypes:
             _add("BBR-WEB-FP-001", "Web technology fingerprint observed", "informational", asset, f"WEB-FP-{i+1:03d}", "Technology fingerprinting improves inventory and helps prioritize version verification without confirming a vulnerability by itself.", "Review fingerprinted technologies and confirm precise versions through authorized configuration or package review.", "Re-run WhatWeb and compare against authenticated asset inventory.", "medium")
-        if "waf_signal" in ftypes:
-            _add("BBR-WAF-INFO-001", "WAF/CDN protection signal observed", "informational", asset, f"WEB-FP-{i+1:03d}", "A WAF/CDN signal affects testing strategy, false positives, and interpretation of HTTP status behavior.", "Document the control path and coordinate testing with the client to avoid misreading WAF responses as application behavior.", "Re-run WAF detection and confirm with architecture or CDN/WAF configuration review.", "medium")
-    dns = results.get("dns_record_enrichment") or {}
-    dns_records = []
-    for row in dns.get("results") or []:
-        if row.get("records"):
-            dns_records.extend(row.get("records") or [])
-    if dns_records:
-        _add("BBR-DNS-INFO-001", "DNS record inventory observed", "informational", str(dns.get("target") or "target"), "DNS-ENUM-001", "DNS records provide external attack-surface inventory and may reveal hosting, mail, or certificate-control dependencies.", "Review DNS record inventory for stale records, unintended exposure, and policy controls such as SPF/DMARC/CAA when applicable.", "Re-run DNS enrichment and compare records to the authoritative asset inventory.", "medium")
-    if int((results.get("screenshot_triage") or {}).get("screenshots_captured") or 0) > 0:
-        _add("BBR-WEB-SCREEN-001", "Web screenshots captured for triage", "informational", "web", "SCREENSHOT-TRIAGE-001", "Screenshots provide visual triage evidence for exposed web services and help prioritize manual review.", "Review captured screenshots for login panels, admin interfaces, default pages, and exposed application context.", "Open screenshot paths listed in screenshot_triage results and confirm pages match expected services.", "high")
     return out
 
 
@@ -280,21 +269,22 @@ def _refresh_summary_and_evidence(engine: Any, results: Dict[str, Any], modules:
     summary["tls_services_analyzed"] = len((results.get("tls_analysis") or {}).get("results") or [])
     summary["service_enum_modules_run"] = int((results.get("service_enumeration") or {}).get("modules_run") or 0)
     summary["web_fingerprint_modules_run"] = int((results.get("web_fingerprinting") or {}).get("modules_run") or 0)
+    summary["cms_signals_observed"] = int((results.get("cms_enumeration") or {}).get("cms_signals") or 0)
     summary["dns_record_queries_run"] = int((results.get("dns_record_enrichment") or {}).get("queries_run") or 0)
     summary["screenshots_captured"] = int((results.get("screenshot_triage") or {}).get("screenshots_captured") or 0)
-    modules_executed = list(dict.fromkeys(list(modules) + ["http_headers", "tls", "service_enum", "web_fingerprint", "dns_enrichment", "screenshot_triage"]))
+    modules_executed = list(dict.fromkeys(list(modules) + ["http_headers", "tls", "service_enum", "web_fingerprint", "cms_enum", "dns_enrichment", "screenshot_triage"]))
     results["evidence_package"] = build_evidence_package(results, modules_executed, lab_mode=getattr(engine, "_rt", None) is None)
     base_findings = list(results["evidence_package"].get("deterministic_findings", []))
     results["deterministic_findings"] = base_findings
     findings = base_findings + _service_findings(results)
     results["deterministic_findings"] = findings
+    findings = findings + _cms_findings(results)
+    results["deterministic_findings"] = findings
     findings = findings + _web_dns_findings(results)
     results["deterministic_findings"] = findings
     results["evidence_package"]["deterministic_findings"] = findings
-    results["evidence_package"].setdefault("service_enumeration", results.get("service_enumeration") or {})
-    results["evidence_package"].setdefault("web_fingerprinting", results.get("web_fingerprinting") or {})
-    results["evidence_package"].setdefault("dns_record_enrichment", results.get("dns_record_enrichment") or {})
-    results["evidence_package"].setdefault("screenshot_triage", results.get("screenshot_triage") or {})
+    for key in ("service_enumeration", "web_fingerprinting", "cms_enumeration", "dns_record_enrichment", "screenshot_triage"):
+        results["evidence_package"].setdefault(key, results.get(key) or {})
     results["deterministic_attack_paths"] = results["evidence_package"].get("deterministic_attack_paths", [])
     results["recon_completed_utc"] = utc_now_iso()
     results["executive_snapshot"] = build_executive_snapshot(results)
@@ -311,11 +301,10 @@ async def _posture_enriched_run(engine: Any, original_run: Any, target: str, mod
     await _run_tls_enrichment(engine, results, urls)
     await _run_service_enrichment(engine, results)
     await _run_web_fingerprint_enrichment(engine, results, urls)
+    await _run_cms_enrichment(engine, results, urls)
     await _run_dns_enrichment(engine, results, target)
     await _run_screenshot_triage(engine, results, urls, target)
     _refresh_summary_and_evidence(engine, results, modules)
-    rprint("\n[bold green][+][/bold green] Service and web posture enrichment complete")
-    rprint(f"    [yellow]HTTP header URLs:[/yellow] [white]{results['summary'].get('http_header_urls_analyzed', 0)}[/white]  [yellow]TLS services:[/yellow] [white]{results['summary'].get('tls_services_analyzed', 0)}[/white]  [yellow]Service modules:[/yellow] [white]{results['summary'].get('service_enum_modules_run', 0)}[/white]  [yellow]Web FP modules:[/yellow] [white]{results['summary'].get('web_fingerprint_modules_run', 0)}[/white]  [yellow]DNS queries:[/yellow] [white]{results['summary'].get('dns_record_queries_run', 0)}[/white]  [yellow]Screenshots:[/yellow] [white]{results['summary'].get('screenshots_captured', 0)}[/white]")
     return results
 
 
