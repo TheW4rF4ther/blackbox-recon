@@ -154,6 +154,8 @@ def _install_default_phase_suppressor() -> None:
             "Done. Stay safe",
             "Interrupted by user",
             "Error:",
+            "Recon progress:",
+            "Core scan",
         )
         if any(tok in text for tok in keep_tokens):
             return original_print(*objects, **kwargs)
@@ -270,7 +272,14 @@ def patch_operator_dashboard(ReconEngine: Any) -> None:
         _install_default_phase_suppressor()
         _install_recon_rprint_suppressor()
         _install_enrichment_progress_wrappers()
+        core_start = time.monotonic()
+        if progress_enabled():
+            progress_console.print("[cyan][core][/cyan] [bold]Core scan:[/bold] discovery, port scan, and initial web content discovery [dim](running)[/dim]")
+            progress_console.print("[dim]    If this pauses after subdomain checks, Nmap or content discovery is usually running.[/dim]")
         results = await original_run(self, target, modules)
+        if progress_enabled():
+            elapsed = time.monotonic() - core_start
+            progress_console.print(f"[green][core][/green] Core scan complete [dim]({elapsed:.1f}s)[/dim]")
         try:
             render_triage_dashboard(results)
             _install_legacy_terminal_suppressor()
