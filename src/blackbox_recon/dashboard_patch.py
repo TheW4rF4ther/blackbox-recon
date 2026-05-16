@@ -57,6 +57,95 @@ def _install_legacy_terminal_suppressor() -> None:
     console._blackbox_legacy_suppressor = True
 
 
+def _install_default_phase_suppressor() -> None:
+    """Suppress detailed phase chatter in normal mode.
+
+    The phase trace remains in JSON/Markdown artifacts. The default terminal
+    should behave like an operator console, not a verbose debug log.
+    """
+    cli_mod = sys.modules.get("blackbox_recon.cli") or sys.modules.get("src.blackbox_recon.cli")
+    if cli_mod is None or not hasattr(cli_mod, "console"):
+        return
+    console = cli_mod.console
+    if getattr(console, "_blackbox_phase_suppressor", False):
+        return
+
+    original_print = console.print
+    state = {"suppress_block": False}
+
+    def filtered_print(*objects: Any, **kwargs: Any) -> None:
+        text = " ".join(str(o) for o in objects)
+        stripped = text.strip()
+
+        # Keep branding, notice, high-level start, dashboard, AI status, report path, and final footer.
+        keep_tokens = (
+            "Blackbox Recon",
+            "Notice",
+            "[*] Running reconnaissance",
+            "[+] Starting reconnaissance",
+            "Operator Assessment",
+            "Scope & Limitations",
+            "Executive Recon Snapshot",
+            "Attack Surface",
+            "Service Assessments",
+            "Service Findings",
+            "Technical Verification Targets",
+            "Evidence Artifacts",
+            "Tester Takeaway",
+            "AI analysis",
+            "[AI] Applied",
+            "Attack surface analysis",
+            "Results saved to",
+            "Done. Stay safe",
+            "Interrupted by user",
+            "Error:",
+        )
+        if any(tok in text for tok in keep_tokens):
+            state["suppress_block"] = False
+            return original_print(*objects, **kwargs)
+
+        # Suppress verbose PTES/phase scaffolding and command echo in default mode.
+        noisy_tokens = (
+            "PTES M",
+            "Intelligence Gathering",
+            "Threat Modeling",
+            "Vulnerability Analysis",
+            "Objective:",
+            "Stack:",
+            "Wordlist:",
+            "method:",
+            "nmap_",
+            "nslookup",
+            "feroxbuster:",
+            "requests_",
+            "tls_probe:",
+            "nikto_http:",
+            "whatweb:",
+            "wafw00f:",
+            "dns_PTR:",
+            "screenshot:",
+            "Execution recap",
+            "Phase complete",
+            "Reconnaissance complete",
+            "Service and web posture enrichment complete",
+            "Subdomains:",
+            "Open TCP ports:",
+            "HTTP header URLs:",
+            "Running nslookup",
+            "Enumerating subdomains",
+            "Found 0 valid subdomains",
+            "Default port scan:",
+            "Web content discovery on",
+        )
+        if any(tok in text for tok in noisy_tokens) or stripped.startswith("─") or stripped.startswith("·") or stripped.startswith("→"):
+            return
+
+        return original_print(*objects, **kwargs)
+
+    console.print = filtered_print
+    console._blackbox_phase_suppressor = True
+
+
 class DashboardAwareResults(dict):
     """Suppress old duplicate CLI tables while preserving saved JSON data."""
 
@@ -80,6 +169,7 @@ def patch_operator_dashboard(ReconEngine: Any) -> None:
     if getattr(ReconEngine, "_blackbox_operator_dashboard_patched", False):
         return
 
+    _install_default_phase_suppressor()
     original_run = ReconEngine.run
 
     async def run_with_operator_dashboard(self: Any, target: str, modules: List[str]) -> Dict[str, Any]:
