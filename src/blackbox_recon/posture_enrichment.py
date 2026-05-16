@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 from rich import print as rprint
-from rich.markup import escape
 
 from .dns_enum import run_dns_enrichment
 from .evidence import build_evidence_package
@@ -23,6 +22,7 @@ from .reporting import build_executive_snapshot, utc_now_iso
 from .screenshots import run_screenshot_triage
 from .service_enum import run_service_enumeration
 from .tls_scan import scan_tls_url
+from .vuln_intel import run_vulnerability_intel
 from .web_cms import run_cms_enumeration
 from .web_fingerprint import run_web_fingerprinting
 
@@ -36,11 +36,6 @@ def _dedupe(seq: Iterable[str]) -> List[str]:
         seen.add(item)
         out.append(item)
     return out
-
-
-def _quiet() -> bool:
-    # Default operator mode should be quiet. Verbose phase echo is handled by execution_trace.
-    return True
 
 
 def _trace_append(results: Dict[str, Any], *, phase_id: str, phase_name: str, status: str, detail: str, stack_lines: List[str], commands: List[Dict[str, Any]]) -> None:
@@ -161,6 +156,22 @@ async def _run_cms_enrichment(engine: Any, results: Dict[str, Any], urls: List[s
     _trace_append(results, phase_id="M9B", phase_name="CMS and app-aware web enumeration", status="completed", detail=f"{cms.get('cms_signals', 0)} CMS/app signal group(s) observed across {cms.get('urls_considered', 0)} URL(s)", stack_lines=["Stack: CMS path probes + WPScan when WordPress is detected"], commands=commands)
 
 
+async def _run_vuln_intel_enrichment(engine: Any, results: Dict[str, Any]) -> None:
+    if not bool(getattr(engine, "config", {}).get("vuln_intel_enabled", True)):
+        _trace_append(results, phase_id="M12", phase_name="Vulnerability intelligence lookup", status="skipped", detail="vuln_intel_enabled is false", stack_lines=["Stack: searchsploit + NVD keyword lookups"], commands=[])
+        return
+    ss_timeout = int(getattr(engine, "config", {}).get("searchsploit_timeout_sec", 30) or 30)
+    nvd_timeout = int(getattr(engine, "config", {}).get("nvd_timeout_sec", 12) or 12)
+    max_signals = int(getattr(engine, "config", {}).get("vuln_intel_max_signals", 12) or 12)
+    loop = asyncio.get_running_loop()
+    intel = await loop.run_in_executor(None, partial(run_vulnerability_intel, results, searchsploit_timeout_sec=ss_timeout, nvd_timeout_sec=nvd_timeout, max_signals=max_signals))
+    results["vulnerability_intel"] = intel
+    commands: List[Dict[str, Any]] = []
+    for lookup in intel.get("lookups") or []:
+        commands.append({"label": lookup.get("source"), "command": lookup.get("query"), "status": lookup.get("status"), "matches": len(lookup.get("matches") or [])})
+    _trace_append(results, phase_id="M12", phase_name="Vulnerability intelligence lookup", status="completed", detail=f"{len(intel.get('candidate_leads') or [])} candidate vulnerability/exploit lead(s) from {len(intel.get('signals') or [])} version signal(s)", stack_lines=["Stack: searchsploit + NVD keyword lookups"], commands=commands)
+
+
 async def _run_dns_enrichment(engine: Any, results: Dict[str, Any], target: str) -> None:
     if not bool(getattr(engine, "config", {}).get("dns_enrichment_enabled", True)):
         _trace_append(results, phase_id="M10", phase_name="DNS record enrichment", status="skipped", detail="dns_enrichment_enabled is false", stack_lines=["Stack: dig when installed; Python socket fallback"], commands=[])
@@ -270,9 +281,10 @@ def _refresh_summary_and_evidence(engine: Any, results: Dict[str, Any], modules:
     summary["service_enum_modules_run"] = int((results.get("service_enumeration") or {}).get("modules_run") or 0)
     summary["web_fingerprint_modules_run"] = int((results.get("web_fingerprinting") or {}).get("modules_run") or 0)
     summary["cms_signals_observed"] = int((results.get("cms_enumeration") or {}).get("cms_signals") or 0)
+    summary["vuln_intel_leads"] = len((results.get("vulnerability_intel") or {}).get("candidate_leads") or [])
     summary["dns_record_queries_run"] = int((results.get("dns_record_enrichment") or {}).get("queries_run") or 0)
     summary["screenshots_captured"] = int((results.get("screenshot_triage") or {}).get("screenshots_captured") or 0)
-    modules_executed = list(dict.fromkeys(list(modules) + ["http_headers", "tls", "service_enum", "web_fingerprint", "cms_enum", "dns_enrichment", "screenshot_triage"]))
+    modules_executed = list(dict.fromkeys(list(modules) + ["http_headers", "tls", "service_enum", "web_fingerprint", "cms_enum", "vuln_intel", "dns_enrichment", "screenshot_triage"]))
     results["evidence_package"] = build_evidence_package(results, modules_executed, lab_mode=getattr(engine, "_rt", None) is None)
     base_findings = list(results["evidence_package"].get("deterministic_findings", []))
     results["deterministic_findings"] = base_findings
@@ -283,7 +295,7 @@ def _refresh_summary_and_evidence(engine: Any, results: Dict[str, Any], modules:
     findings = findings + _web_dns_findings(results)
     results["deterministic_findings"] = findings
     results["evidence_package"]["deterministic_findings"] = findings
-    for key in ("service_enumeration", "web_fingerprinting", "cms_enumeration", "dns_record_enrichment", "screenshot_triage"):
+    for key in ("service_enumeration", "web_fingerprinting", "cms_enumeration", "vulnerability_intel", "dns_record_enrichment", "screenshot_triage"):
         results["evidence_package"].setdefault(key, results.get(key) or {})
     results["deterministic_attack_paths"] = results["evidence_package"].get("deterministic_attack_paths", [])
     results["recon_completed_utc"] = utc_now_iso()
@@ -294,6 +306,7 @@ async def _posture_enriched_run(engine: Any, original_run: Any, target: str, mod
     results = await original_run(target, modules)
     if "portscan" not in modules:
         await _run_dns_enrichment(engine, results, target)
+        await _run_vuln_intel_enrichment(engine, results)
         _refresh_summary_and_evidence(engine, results, modules)
         return results
     urls = _web_urls_from_results(results, engine)
@@ -302,6 +315,7 @@ async def _posture_enriched_run(engine: Any, original_run: Any, target: str, mod
     await _run_service_enrichment(engine, results)
     await _run_web_fingerprint_enrichment(engine, results, urls)
     await _run_cms_enrichment(engine, results, urls)
+    await _run_vuln_intel_enrichment(engine, results)
     await _run_dns_enrichment(engine, results, target)
     await _run_screenshot_triage(engine, results, urls, target)
     _refresh_summary_and_evidence(engine, results, modules)
