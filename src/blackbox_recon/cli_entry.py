@@ -16,6 +16,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from . import cli
+from .config import Config as BaseConfig
 
 BANNER_ORANGE = "#d97706"
 
@@ -133,6 +134,50 @@ def _save_openai_key_to_config(api_key: str) -> Path:
     return config_path
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except Exception:
+        return default
+
+
+def _apply_config_env_overrides(cfg: BaseConfig) -> BaseConfig:
+    """Apply entrypoint scan profile environment overrides to loaded config."""
+    mode = os.environ.get("BLACKBOX_RECON_PORT_SCAN_MODE")
+    ports = os.environ.get("BLACKBOX_RECON_PORTS")
+    if mode:
+        cfg.recon.port_scan_mode = mode
+    if ports:
+        cfg.recon.ports = ports
+    if "BLACKBOX_RECON_NMAP_SCAN_TIMEOUT_SEC" in os.environ:
+        cfg.recon.nmap_scan_timeout = _env_int("BLACKBOX_RECON_NMAP_SCAN_TIMEOUT_SEC", cfg.recon.nmap_scan_timeout)
+    if "BLACKBOX_RECON_NMAP_AGGRESSIVE_TIMEOUT_SEC" in os.environ:
+        cfg.recon.nmap_aggressive_timeout_sec = _env_int("BLACKBOX_RECON_NMAP_AGGRESSIVE_TIMEOUT_SEC", cfg.recon.nmap_aggressive_timeout_sec)
+    if "BLACKBOX_RECON_DIRECTORY_TIMEOUT_SEC" in os.environ:
+        cfg.recon.directory_timeout_sec = _env_int("BLACKBOX_RECON_DIRECTORY_TIMEOUT_SEC", cfg.recon.directory_timeout_sec)
+    return cfg
+
+
+class EntryConfig(BaseConfig):
+    """Config wrapper that honors entrypoint profile overrides."""
+
+    @classmethod
+    def load_from_file(cls, config_path: str) -> BaseConfig:
+        return _apply_config_env_overrides(BaseConfig.load_from_file(config_path))
+
+    @classmethod
+    def get_default_path(cls) -> Path:
+        return BaseConfig.get_default_path()
+
+    def __init__(self, **data):  # type: ignore[no-untyped-def]
+        super().__init__(**data)
+        _apply_config_env_overrides(self)
+
+
+def _patch_cli_config() -> None:
+    cli.Config = EntryConfig
+
+
 def _apply_operator_scan_profile() -> None:
     """Apply CLI-only scan profiles before the underlying Click command runs.
 
@@ -152,8 +197,6 @@ def _apply_operator_scan_profile() -> None:
         os.environ.setdefault("BLACKBOX_RECON_NMAP_AGGRESSIVE_TIMEOUT_SEC", "7200")
         return
 
-    # Normal/default operator profile: finish the core phase in sane time, then
-    # let service-specific modules, CMS probes, SearchSploit/NVD, and AI add depth.
     profile = "fast" if fast else os.environ.get("BLACKBOX_RECON_SCAN_PROFILE", "normal").strip().lower()
     if profile in ("normal", "fast", "quick", "operator", ""):
         os.environ["BLACKBOX_RECON_SCAN_PROFILE"] = "fast" if fast else "normal"
@@ -185,9 +228,10 @@ def _preparse_api_key_flags() -> None:
 
 
 def main() -> None:
-    """Patch the banner and delegate to the original CLI entrypoint."""
+    """Patch the banner/config and delegate to the original CLI entrypoint."""
     _preparse_api_key_flags()
     _apply_operator_scan_profile()
+    _patch_cli_config()
     cli.BANNER_ART = BLACKBOX_ASCII
     cli.print_banner = print_banner
     cli.main()
