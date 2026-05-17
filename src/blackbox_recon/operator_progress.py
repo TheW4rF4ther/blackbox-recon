@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from typing import Any, Awaitable, Optional, TypeVar
+from typing import Awaitable, Optional, TypeVar
 
 from rich.console import Console
+from rich.live import Live
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.text import Text
 
 
 console = Console()
@@ -21,18 +23,30 @@ def progress_enabled() -> bool:
 
 
 def heartbeat_interval() -> float:
-    raw = os.environ.get("BLACKBOX_RECON_HEARTBEAT_SEC", "8").strip()
+    raw = os.environ.get("BLACKBOX_RECON_HEARTBEAT_SEC", "1").strip()
     try:
-        return max(3.0, float(raw))
+        return max(0.5, float(raw))
     except Exception:
-        return 8.0
+        return 1.0
+
+
+def _heartbeat_text(label: str, frame: str, elapsed: float, detail: str = "") -> Text:
+    text = Text()
+    text.append(frame, style="bold cyan")
+    text.append(" Running: ", style="bold")
+    text.append(label, style="bold bright_white")
+    text.append(f" ({elapsed:.0f}s elapsed)", style="dim")
+    if detail:
+        text.append(" — ", style="dim")
+        text.append(detail, style="dim")
+    return text
 
 
 async def with_heartbeat(label: str, awaitable: Awaitable[T], *, detail: str = "") -> T:
-    """Run an awaitable while printing a low-noise heartbeat.
+    """Run an awaitable while showing one live-updating heartbeat line.
 
-    This intentionally avoids percentages. It only proves the operator that the
-    scan is still alive during quiet long-running subprocesses.
+    This intentionally avoids percentages. It proves the scan is alive during
+    quiet subprocesses without filling the terminal with repeated status lines.
     """
     if not progress_enabled():
         return await awaitable
@@ -42,29 +56,32 @@ async def with_heartbeat(label: str, awaitable: Awaitable[T], *, detail: str = "
     frames = ("◐", "◓", "◑", "◒")
     interval = heartbeat_interval()
 
-    async def _beat() -> None:
+    async def _beat(live: Live) -> None:
         i = 0
         while not done.is_set():
             elapsed = time.monotonic() - start
-            msg = f"[cyan]{frames[i % len(frames)]}[/cyan] [bold]Running:[/bold] {label} [dim]({elapsed:.0f}s elapsed)[/dim]"
-            if detail:
-                msg += f" [dim]— {detail}[/dim]"
-            console.print(msg)
+            live.update(_heartbeat_text(label, frames[i % len(frames)], elapsed, detail))
             i += 1
             try:
                 await asyncio.wait_for(done.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 pass
 
-    task = asyncio.create_task(_beat())
-    try:
-        return await awaitable
-    finally:
-        done.set()
+    with Live(
+        _heartbeat_text(label, frames[0], 0.0, detail),
+        console=console,
+        refresh_per_second=8,
+        transient=True,
+    ) as live:
+        task = asyncio.create_task(_beat(live))
         try:
-            await task
-        except Exception:
-            pass
+            return await awaitable
+        finally:
+            done.set()
+            try:
+                await task
+            except Exception:
+                pass
 
 
 class OperatorProgress:
