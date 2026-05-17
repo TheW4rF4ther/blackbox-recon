@@ -2,7 +2,7 @@
 
 This module keeps the functional CLI in ``blackbox_recon.cli`` untouched,
 replaces the startup banner, and handles a tiny pre-parse layer for secrets
-that should be available before the main Click command resolves config.
+and operator scan profiles before the main Click command resolves config.
 """
 
 from __future__ import annotations
@@ -128,6 +128,36 @@ def _save_openai_key_to_config(api_key: str) -> Path:
     return config_path
 
 
+def _apply_operator_scan_profile() -> None:
+    """Apply CLI-only scan profiles before the underlying Click command runs.
+
+    Default operator mode should not spend 60+ minutes inside full-port aggressive
+    Nmap. Use --deep when that behavior is explicitly desired.
+    """
+    argv = sys.argv
+    deep = _pop_bool_flag(argv, "--deep", "--deep-scan", "--nmap-deep")
+    fast = _pop_bool_flag(argv, "--fast", "--quick")
+
+    if deep and fast:
+        raise SystemExit("Choose either --deep or --fast, not both")
+
+    if deep:
+        os.environ["BLACKBOX_RECON_SCAN_PROFILE"] = "deep"
+        os.environ["BLACKBOX_RECON_PORT_SCAN_MODE"] = "nmap_aggressive"
+        os.environ.setdefault("BLACKBOX_RECON_NMAP_AGGRESSIVE_TIMEOUT_SEC", "7200")
+        return
+
+    # Normal/default operator profile: finish the core phase in sane time, then
+    # let service-specific modules, CMS probes, SearchSploit/NVD, and AI add depth.
+    profile = "fast" if fast else os.environ.get("BLACKBOX_RECON_SCAN_PROFILE", "normal").strip().lower()
+    if profile in ("normal", "fast", "quick", "operator", ""):
+        os.environ["BLACKBOX_RECON_SCAN_PROFILE"] = "fast" if fast else "normal"
+        os.environ.setdefault("BLACKBOX_RECON_PORT_SCAN_MODE", "tcp_connect")
+        os.environ.setdefault("BLACKBOX_RECON_PORTS", "top1000")
+        os.environ.setdefault("BLACKBOX_RECON_NMAP_SCAN_TIMEOUT_SEC", "180")
+        os.environ.setdefault("BLACKBOX_RECON_DIRECTORY_TIMEOUT_SEC", "300")
+
+
 def _preparse_api_key_flags() -> None:
     """Handle API key convenience flags before delegating to Click.
 
@@ -152,6 +182,7 @@ def _preparse_api_key_flags() -> None:
 def main() -> None:
     """Patch the banner and delegate to the original CLI entrypoint."""
     _preparse_api_key_flags()
+    _apply_operator_scan_profile()
     cli.BANNER_ART = BLACKBOX_ASCII
     cli.print_banner = print_banner
     cli.main()
