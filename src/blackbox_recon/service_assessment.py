@@ -59,6 +59,24 @@ def _headers_for(host: str, port: int, results: Dict[str, Any]) -> List[Dict[str
     return [r for r in (results.get("http_header_analysis") or {}).get("results") or [] if isinstance(r, dict) and str(r.get("url") or "").rstrip("/") == base]
 
 
+def _cms_for(host: str, port: int, results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    base = _http_asset_url(host, port).rstrip("/")
+    return [r for r in (results.get("cms_enumeration") or {}).get("results") or [] if isinstance(r, dict) and str(r.get("url") or "").rstrip("/") == base]
+
+
+def _vuln_leads_for_asset(asset_tokens: List[str], results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    leads: List[Dict[str, Any]] = []
+    for lead in (results.get("vulnerability_intel") or {}).get("candidate_leads") or []:
+        if not isinstance(lead, dict):
+            continue
+        asset = str(lead.get("asset") or "")
+        query = str(lead.get("query") or "")
+        blob = f"{asset} {query}".lower()
+        if any(tok.lower() in blob for tok in asset_tokens if tok):
+            leads.append(lead)
+    return leads[:12]
+
+
 def _tls_for(host: str, port: int, results: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [r for r in (results.get("tls_analysis") or {}).get("results") or [] if isinstance(r, dict) and str(r.get("host")) == str(host) and int(r.get("port") or 0) == int(port)]
 
@@ -82,7 +100,7 @@ def _completion_only(ftype: str) -> bool:
 
 
 def _finding_values(f: Dict[str, Any]) -> str:
-    for key in ("values", "shares", "capabilities", "banner", "observed"):
+    for key in ("values", "shares", "capabilities", "banner", "observed", "path", "url", "version", "users", "theme"):
         if key in f and f.get(key):
             val = f.get(key)
             if isinstance(val, list):
@@ -103,6 +121,20 @@ def _service_tools(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if isinstance(row, dict):
             tools.append({"tool": row.get("tool") or row.get("module") or "tool", "module": row.get("module"), "status": row.get("status"), "artifact_path": row.get("artifact_path")})
     return tools
+
+
+def _add_vuln_leads(candidates: List[Dict[str, Any]], observed: List[str], verify: List[str], leads: List[Dict[str, Any]]) -> None:
+    for lead in leads[:8]:
+        src = str(lead.get("source") or "vuln-intel").upper()
+        ident = lead.get("id") or lead.get("title") or lead.get("query")
+        title = lead.get("title") or lead.get("description") or ident
+        severity = "medium"
+        if str(lead.get("severity") or "").upper() in ("CRITICAL", "HIGH"):
+            severity = "high"
+        candidates.append({"status": "candidate", "severity": severity, "title": f"{src} candidate lead: {ident}", "evidence": _short(title, 240)})
+        _add_unique(observed, f"Vulnerability intelligence lead from {src}: {_short(ident, 120)}")
+    if leads:
+        verify.insert(0, "Validate candidate CVE/Exploit-DB leads against exact affected version, configuration, and exploit preconditions.")
 
 
 def _assess_ssh(host: str, port: int, port_row: Dict[str, Any], results: Dict[str, Any]) -> Dict[str, Any]:
@@ -131,6 +163,7 @@ def _assess_ssh(host: str, port: int, port_row: Dict[str, Any], results: Dict[st
             if typ in ("weak_ssh_algorithm_signal", "ssh_audit_fail", "ssh_audit_warn"):
                 weak_seen = True
                 candidates.append({"status": "candidate", "severity": "medium", "title": "SSH cryptographic hardening issue requires validation", "evidence": _finding_values(f) or typ})
+    _add_vuln_leads(candidates, observed, verify, _vuln_leads_for_asset([f"{host}:{port}", "openssh", "ssh"], results))
     if audit_seen and not weak_seen:
         _add_unique(negative, "ssh-audit completed; no fail/warn signal extracted by parser.")
     if not weak_seen:
@@ -163,11 +196,42 @@ def _assess_http(host: str, port: int, port_row: Dict[str, Any], results: Dict[s
         disclosure = row.get("disclosure_headers") or {}
         if row.get("title"):
             _add_unique(observed, f"HTTP title: {row.get('title')}")
+        # Header issues are useful hardening notes but should not dominate lab vulnerability triage.
         if missing:
-            candidates.append({"status": "candidate", "severity": "low", "title": "Missing HTTP security headers observed", "evidence": ", ".join(map(str, missing[:8]))})
-            verify.append("Validate missing security headers against application context and client standard.")
+            _add_unique(notes, f"HTTP hardening note: missing headers observed ({', '.join(map(str, missing[:6]))}).")
+            verify.append("Validate missing security headers after primary application attack surface is understood.")
         if disclosure:
-            candidates.append({"status": "candidate", "severity": "low", "title": "HTTP disclosure headers observed", "evidence": _short(disclosure, 220)})
+            _add_unique(notes, f"HTTP disclosure note: {_short(disclosure, 180)}")
+    for cms in _cms_for(host, port, results):
+        if cms.get("wpscan") and isinstance(cms.get("wpscan"), dict) and cms["wpscan"].get("artifact_path"):
+            _add_unique(artifacts, cms["wpscan"].get("artifact_path"))
+        cms_names = cms.get("cms") or []
+        if cms_names:
+            _add_unique(observed, f"CMS/app detected: {', '.join(map(str, cms_names))}")
+            candidates.append({"status": "candidate", "severity": "medium", "title": f"CMS/application pivot detected: {', '.join(map(str, cms_names))}", "evidence": "CMS-specific enumeration produced application signals."})
+            verify.insert(0, "Prioritize CMS/application-specific vulnerability validation and authentication surface review.")
+        for f in cms.get("findings") or []:
+            if not isinstance(f, dict):
+                continue
+            typ = _finding_type(f)
+            if typ == "cms_detected":
+                continue
+            title = typ.replace("_", " ").title()
+            sev = "medium"
+            if typ in ("wordpress_version", "wordpress_login_found", "wordpress_xmlrpc_enabled", "wordpress_users_identified", "interesting_path"):
+                candidates.append({"status": "candidate", "severity": sev, "title": title, "evidence": _finding_values(f) or typ})
+                if typ == "wordpress_version":
+                    verify.insert(0, "Research WordPress core version for known CVEs and exploit preconditions.")
+                elif typ == "wordpress_login_found":
+                    verify.insert(0, "Review WordPress login behavior, username exposure, lockout, and MFA/rate limiting under ROE.")
+                elif typ == "wordpress_xmlrpc_enabled":
+                    verify.insert(0, "Validate WordPress XML-RPC exposure, methods, and rate limiting under ROE.")
+                elif typ == "wordpress_users_identified":
+                    verify.insert(0, "Treat enumerated usernames as credential-attack surface; only test passwords if explicitly authorized.")
+                elif typ == "interesting_path":
+                    verify.insert(0, "Manually browse interesting discovered paths and validate access control/content sensitivity.")
+            elif typ.endswith("known_path"):
+                _add_unique(observed, f"Known application path observed: {_finding_values(f) or typ}")
     service_rows = _service_rows_for(host, port, results)
     for row in service_rows:
         if row.get("artifact_path"):
@@ -176,6 +240,7 @@ def _assess_http(host: str, port: int, port_row: Dict[str, Any], results: Dict[s
             if isinstance(f, dict) and not _completion_only(_finding_type(f)) and _finding_type(f) in ("nikto_interesting_observations", "http_webdav_enabled"):
                 typ = _finding_type(f)
                 candidates.append({"status": "candidate", "severity": "medium", "title": typ.replace("_", " ").title(), "evidence": _finding_values(f) or typ})
+    _add_vuln_leads(candidates, observed, verify, _vuln_leads_for_asset([url.rstrip("/"), f"{host}:{port}", "wordpress", "apache", "http"], results))
     for ss in _screenshots_for(host, port, results):
         if ss.get("screenshot_path"):
             _add_unique(artifacts, ss.get("screenshot_path"))
@@ -255,6 +320,7 @@ def build_service_assessments(results: Dict[str, Any]) -> Dict[str, Any]:
                 for f in row.get("findings") or []:
                     if isinstance(f, dict) and not _completion_only(_finding_type(f)):
                         detail["candidate_findings"].append({"status": "candidate", "severity": "medium", "title": _finding_type(f).replace("_", " ").title(), "evidence": _finding_values(f) or _finding_type(f)})
+            _add_vuln_leads(detail["candidate_findings"], detail["observed"], detail["verification_targets"], _vuln_leads_for_asset([f"{host}:{port}", label.lower()], results))
         base.update(detail)
         assessments.append(base)
 
