@@ -20,44 +20,49 @@ from . import cli
 BANNER_ORANGE = "#d97706"
 
 BLACKBOX_ASCII = r"""
-                        ---
-                     ---------
-                  ---------------
-              ----------    ---------
-           ----------          ---------
-        ---------     -------     ---------
-         -----        -------         ----
-             ---         -         ----
-        --      ----  --    -   ---      --
-        -----      -------------      -----
-        ---------     +------     ------
-        ----  ------           ------
-        ----      --           ---      ---
-        ------           -           ------
-        ----------      --       ----------
-           ----------   --    ----------
-              ---- ------- ----------
-                    --------------
-                    -----------
-                        ---
+       ---
+    ---------
+  -------------
+------     ------
+---    ---    ---
+  --    -    --
+--  -- --- --  --
+----   ---   ----
+---  --   --  ---
+----    -    ----
+------  -  ------
+  ----- - -----
+     -------
+       ---
 """.strip("\n")
 
 RECON_ASCII = r"""
-██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗
-██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗  ██║
-██████╔╝█████╗  ██║     ██║   ██║██╔██╗ ██║
-██╔══██╗██╔══╝  ██║     ██║   ██║██║╚██╗██║
-██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║
-╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝
+ ____  _____ ____ ___  _   _
+|  _ \| ____/ ___/ _ \| \ | |
+| |_) |  _|| |  | | | |  \| |
+|  _ <| |__| |__| |_| | |\  |
+|_| \_\_____\____\___/|_| \_|
 """.strip("\n")
 
 
+def _side_by_side(left: str, right: str, gap: int = 4) -> str:
+    """Render two ASCII blocks side-by-side with top alignment."""
+    left_lines = left.splitlines()
+    right_lines = right.splitlines()
+    height = max(len(left_lines), len(right_lines))
+    left_width = max((len(line) for line in left_lines), default=0)
+    out = []
+    for idx in range(height):
+        l = left_lines[idx] if idx < len(left_lines) else ""
+        r = right_lines[idx] if idx < len(right_lines) else ""
+        out.append(f"{l:<{left_width}}{' ' * gap}{r}")
+    return "\n".join(out).rstrip()
+
+
 def print_banner() -> None:
-    """Print the Blackbox Recon banner with orange logo art."""
+    """Print the Blackbox Recon banner with compact orange logo art."""
     banner = Text()
-    banner.append(BLACKBOX_ASCII, style=f"bold {BANNER_ORANGE}")
-    banner.append("\n\n")
-    banner.append(RECON_ASCII, style=f"bold {BANNER_ORANGE}")
+    banner.append(_side_by_side(BLACKBOX_ASCII, RECON_ASCII), style=f"bold {BANNER_ORANGE}")
     banner.append("\n\n")
     banner.append("AI-Augmented Reconnaissance for Pentesters", style="bold bright_white")
     banner.append("\n")
