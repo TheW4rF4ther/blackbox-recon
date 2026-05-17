@@ -58,7 +58,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "blackbox-recon=blackbox_recon.cli:main",
+            "blackbox-recon=blackbox_recon.cli_entry:main",
         ],
     },
     include_package_data=True,
